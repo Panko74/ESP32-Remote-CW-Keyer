@@ -1,0 +1,8 @@
+.pio/
+.vscode/
+*.o
+*.elf
+*.bin
+build/
+__pycache__/
+*.pyc
