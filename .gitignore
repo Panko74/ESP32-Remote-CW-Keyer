@@ -6,3 +6,11 @@
 build/
 __pycache__/
 *.pyc
+
+# Backup directories
+backup_20260708_wstx_fix/
+backup_20260708_rawtcp_fix/
+backup_20260709_final_working/
+BAK/
+src/main.cpp.bak
+Note.txt
