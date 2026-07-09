@@ -65,7 +65,7 @@ ESP32-C6-DevKitC-1
 | GPIO 4 | WPM UP | Input pull-up, GND = premuto |
 | GPIO 5 | WPM DOWN | Input pull-up, GND = premuto |
 | GPIO 6 | MODE | Input pull-up, GND = premuto |
-| GPIO 7 | OUT RADIO | Uscita, collegata al relè/keyer radio settata in modalità tasto verticale |
+| GPIO 7 | OUT RADIO | Uscita, tramite optoisolatore/relè verso l'ingresso Key della radio, settato in modalità tasto verticale |
 | GPIO 10 | BYPASS | Input pull-up, GND = premuto |
 | GPIO 15 | BUZZER | Uscita PWM 600Hz, pilotare con transistor se necessario |
 | GPIO 18 | I2C SDA | Display SSD1306 |
