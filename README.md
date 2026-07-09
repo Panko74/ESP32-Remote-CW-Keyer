@@ -13,11 +13,11 @@ Il sidetone del TX è in locale su buzzer, per una perfetta sincronia dell'ascol
 ## Architettura
 
 ```
-┌─────────────┐    TCP raw    ┌─────────────┐
+┌──────────────┐    TCP raw      ┌─────────────┐
 │  TX (paddle) │───porta 7373──▶│  RX (radio) │
-│   hotspot    │               │  IP fisso   │
-│   telefono   │               │  router     │
-└─────────────┘               └─────────────┘
+│   hotspot    │                 │  IP fisso   │
+│   telefono   │                 │  router     │
+└──────────────┘                 └─────────────┘
 ```
 
 - **TX**: si connette via TCP all'IP pubblico dell'RX, porta **7373**
@@ -44,18 +44,18 @@ Il sidetone del TX è in locale su buzzer, per una perfetta sincronia dell'ascol
 
 ```
 ESP32-C6-DevKitC-1
-┌─────────────────────┐
+┌────────────────────────┐
 │ GPIO 2  ── Paddle DOT  │
 │ GPIO 3  ── Paddle DASH │
-│ GPIO 4  ── WPM +     │
-│ GPIO 5  ── WPM −     │
-│ GPIO 6  ── MODE      │
-│ GPIO 7  ── OUT RADIO │
-│ GPIO 10 ── BYPASS    │
-│ GPIO 15 ── BUZZER    │
-│ GPIO 18 ── SDA (I2C) │
-│ GPIO 19 ── SCL (I2C) │
-└─────────────────────┘
+│ GPIO 4  ── WPM +       │
+│ GPIO 5  ── WPM −       │
+│ GPIO 6  ── MODE        │
+│ GPIO 7  ── OUT RADIO   │
+│ GPIO 10 ── BYPASS      │
+│ GPIO 15 ── BUZZER      │
+│ GPIO 18 ── SDA (I2C)   │
+│ GPIO 19 ── SCL (I2C)   │
+└────────────────────────┘
 ```
 
 | Pin | Funzione | Note |
