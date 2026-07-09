@@ -26,7 +26,7 @@
 static const char *TAG = "keyer";
 
 // ============================================================
-// PIN CONFIG (come main.cpp attuale - breadboard già cablata)
+// PIN CONFIG
 // ============================================================
 #define PIN_DOT_NUM        2
 #define PIN_DASH_NUM       3
@@ -124,7 +124,7 @@ static char sta_ip_str[16] = "";
 extern int sta_ap_index;
 
 // ============================================================
-// VOLUME TABLE (come .ino originale)
+// VOLUME TABLE
 // ============================================================
 static const uint32_t vol_table[] = {0, 2, 5, 12, 28, 60, 120, 250, 450, 650, 833};
 
@@ -665,7 +665,7 @@ static void menu_task(void *arg) {
         bool down_pressed = (gpio_get_level(PIN_WPM_DOWN) == 0);
         bool bypass_pressed = (gpio_get_level(PIN_BYPASS) == 0);
 
-        // Gestione sleep display (come Arduino: 15s inactivity)
+        // Gestione sleep display (15s inactivity)
         // Prima pressione: solo risveglia, non esegue l'azione del pulsante
         if (menu_pressed || up_pressed || down_pressed || bypass_pressed) {
             last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
@@ -687,8 +687,8 @@ static void menu_task(void *arg) {
         }
 
         // ============================================================
-        // MODE handler (come .ino originale: entra su MODE, resta in
-        // attesa di combo UP/DOWN per volume, o rilascia per ciclo mode)
+        // MODE handler (entra su MODE, resta in attesa di combo 
+        // UP/DOWN per volume, o rilascia per ciclo mode)
         // ============================================================
         if (menu_pressed) {
             vTaskDelay(pdMS_TO_TICKS(50));  // debounce
@@ -848,7 +848,7 @@ static void startup_test(void) {
 }
 
 // ============================================================
-// SSD1306 OLED DISPLAY (7x14 bold, come .ino originale)
+// SSD1306 OLED DISPLAY (7x14 bold)
 // ============================================================
 
 #define SSD1306_ADDR  0x3C
@@ -1142,7 +1142,7 @@ static void disp_redraw(void) {
         }
         disp_draw_str(0, 16, buf);
         if (online) {
-            // Pallino pieno all'estrema destra
+            // Rettangolo pieno all'estrema destra
             for (int c = 118; c <= 124; c++) fb[c + 2 * 128] |= 0x3F;
         }
 
@@ -2076,8 +2076,6 @@ static void web_server_init(void) {
 
 // ============================================================
 // Raw TCP server task: ascolta su 7373, riceve pacchetti CW
-// Nessun WS, nessun HTTP, solo 8 byte per pacchetto.
-// Non blocca mai l'HTTP server (task separato).
 // ============================================================
 static void tcp_rx_task(void *arg) {
     int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -2218,7 +2216,6 @@ static void net_rx_task(void *arg) {
             jb_last_pkt_us = 0;
         }
 
-        // Stuck key recovery
         // Stuck key recovery: 10s per non tagliare linee lunghe
         int64_t key_timeout = 10000000;
         if (jb_key_on && jb_last_pkt_us > 0 && now - jb_last_pkt_us > key_timeout) {
