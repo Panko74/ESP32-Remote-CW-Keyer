@@ -1,0 +1,69 @@
+# ESP32-C6 Remote Keyer — Note di sviluppo
+
+## Architettura
+- ESP-IDF su PlatformIO, ESP32-C6 (single core)
+- Paddle straight/iambic A/B/bug
+- Buzzer LEDC PWM 600Hz 10-bit, radio out GPIO
+- WiFi AP+STA, web server porta 80, mDNS, UDP beacon discovery
+- OLED SSD1306 auto-detect I2C, sleep 15s
+- NVS save/load: wpm, mode, volume, bypass, role, remote_ip, remote_port, jb_latency, 4 WiFi creds
+
+## Trasporto remoto
+- **WebSocket** su porta 80 (per aggirare blocco 4G su porte non-standard)
+- TX → RX: connessione WebSocket mascherata (RFC 6455), frame binario 8-byte cw_packet_t
+- RX: endpoint /ws sul server HTTP esistente, handler bloccante, push a FreeRTOS queue
+- net_rx_task consuma la coda, processa jitter buffer (128 entry, latency 200ms default)
+- Stati TX: 0=disconnesso 1=TCP in corso 2=WS upgrade inviato 3=WS connesso
+- Reconnect ogni 3s, timeout connect 15s
+- Flag ws_client_connected lato RX per UI/OLED
+
+## Packet format (8 byte packed)
+- uint8_t  type     = 1 ON, 0 OFF
+- uint32_t ts_ms    = timestamp TX (ms)
+- uint16_t dur_ms   = durata OFF (0 per ON)
+- uint8_t  seq      = sequenziale (debug)
+
+## Comandi Seriali
+- N/A (tutto via web UI su porta 80)
+
+## Web UI
+- `/` keyer control (WPM, volume, mode, bypass)
+- `/wifi` WiFi scan + connect
+- `/status` JSON con contatori e stato TCP/WS
+- `/save` salva configurazione
+- `/reconnect` forza reconnect TX
+- `/scan`, `/selwifi`, `/delwifi`
+- Catchall → redirect a `/`
+
+## OLED display
+- Prima riga: MODE WPM VOL
+- Seconda riga: IP / WS status (WS:-- / WS:.. / WS:OK) / BYP / stato RX
+- Terza/quarta: info ruolo (compact mode) o TCP counters + counters (classic mode)
+
+## Problemi risolti
+- Bug POLLOUT: residuo close() dopo tcp_state=2 che uccideva la connessione appena stabilita
+- Iambic B stale next_elt fix
+- Micro-gap ON/OFF su key_on
+- WDT: vTaskDelay(1) invece di taskYIELD()
+- send_key: errno non bloccanti safe (EAGAIN, ENOTCONN, etc.)
+- 15s timeout connect per evitare attesa infinita su 4G
+- WiFi delete compatta array (no buchi)
+
+## Problemi in sospeso
+- (nessuno)
+
+## Pinout
+- DOT=2, DASH=3, OUT_RADIO=7, BUZZER=15
+- WPM_UP=4, WPM_DOWN=5, MENU=6, BYPASS=10
+- I2C_SDA=18, I2C_SCL=19
+
+## Configurazione 4G → RX
+- RX su rete fissa con IP pubblico 185.55.209.71 (no NAT/CGNAT)
+- TX su 4G (carrier blocca porte non-standard)
+- Soluzione: WebSocket su porta 80 (HTTP, mai bloccata)
+- Porta remota config (rport) mantenuta a 7373 per retrocompatibilità ma non usata da TX
+
+## Compilazione
+- PlatformIO + ESP-IDF
+- build_flags = -DCONFIG_HTTPD_WS_SUPPORT=1 (necessario per WebSocket server)
+- board_build.flash_size = 2MB

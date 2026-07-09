@@ -20,7 +20,6 @@
 #include "lwip/netdb.h"
 #include <arpa/inet.h>
 #include "mdns.h"
-#include <sys/poll.h>
 
 
 static const char *TAG = "keyer";
@@ -77,8 +76,8 @@ static const char *TAG = "keyer";
 #define NVS_KEY_VOL     "vol"
 #define NVS_KEY_ROLE    "role"
 #define NVS_KEY_IP      "rip"
+#define NVS_KEY_PORT    "rport"
 #define NVS_KEY_DISP    "disp"
-#define NVS_KEY_JBLAT   "jblat"
 #define NVS_KEY_STA_CNT "stacnt"
 #define NVS_KEY_STA_SSID "stassid"
 #define NVS_KEY_STA_PW  "stapw"
@@ -93,8 +92,8 @@ typedef struct {
     int32_t bypass;
     int32_t role;
     char    remote_ip[16];
+    int32_t remote_port;
     int32_t display_enabled;
-    int32_t jb_latency;
 } keyer_settings_t;
 
 static volatile keyer_settings_t cfg = {
@@ -104,8 +103,8 @@ static volatile keyer_settings_t cfg = {
     .bypass = 0,
     .role = 0,
     .remote_ip = "192.168.1.100",
+    .remote_port = 7373,
     .display_enabled = 0,
-    .jb_latency = 200,
 };
 
 // cfg_mutex will be added in Fase 2 (WiFi)
@@ -121,7 +120,6 @@ static volatile bool sta_connected = false;
 static volatile bool sta_got_ip = false;
 static char sta_ssid_connected[33] = "";
 static char sta_ip_str[16] = "";
-extern int sta_ap_index;
 
 // ============================================================
 // VOLUME TABLE (come .ino originale)
@@ -129,7 +127,7 @@ extern int sta_ap_index;
 static const uint32_t vol_table[] = {0, 2, 5, 12, 28, 60, 120, 250, 450, 650, 833};
 
 // ============================================================
-// CW PACKET PROTOCOL (inviato via WebSocket)
+// UDP PROTOCOL DEFINITION (usato da send_key e udp_rx)
 // ============================================================
 typedef struct __attribute__((packed)) {
     uint8_t type;     // 0x00=OFF, 0x01=ON
@@ -200,18 +198,9 @@ static void radio_out(bool state) {
     }
 }
 
-static int ws_sock = -1;
-static uint8_t pkt_seq = 0;
-static int64_t key_start_us = 0;
-static volatile bool net_ready = false;
-static volatile int tcp_state = 0; // 0=disconnesso 1=connecting(TCP) 2=WS upgrade sent 3=WS connesso
-static int64_t tcp_retry_us = 0;   // timestamp prossimo tentativo reconnect
-static int64_t tcp_connect_us = 0; // qnd è iniziato il tentativo di connect (per timeout)
-
-// RX: coda per pacchetti ricevuti via WebSocket (net_rx_task la consuma)
-static QueueHandle_t rx_pkt_queue = NULL;
-static volatile bool ws_client_connected = false;
-static volatile bool ws_sync_pending = false;
+static int udp_tx_sock = -1;
+static uint8_t udp_tx_seq = 0;
+static int64_t udp_tx_on_us = 0;
 
 static void send_key(bool state) {
     static bool last_state = false;
@@ -219,33 +208,30 @@ static void send_key(bool state) {
     if (state) buzzer_on(); else buzzer_off();
     radio_out(state);
 
-    // TX via TCP: invia cambio stato se ruolo=TX, bypass=OFF e connesso
-    if (cfg.role == 1 && cfg.bypass == 0 && tcp_state == 3 && (state != last_state || ws_sync_pending)) {
-        ws_sync_pending = false;
+    // UDP TX: invia cambio stato se ruolo=TX e bypass=OFF
+    if (cfg.role == 1 && cfg.bypass == 0 && udp_tx_sock >= 0 && state != last_state) {
+        last_state = state;
         cw_packet_t pkt;
         pkt.type = state ? 1 : 0;
         int64_t now_us = esp_timer_get_time();
         pkt.ts_ms = (uint32_t)(now_us / 1000);
-        pkt.dur_ms = state ? 0 : (uint32_t)((now_us - key_start_us) / 1000);
-        pkt.seq = pkt_seq;
-        if (state) key_start_us = now_us;
-        if (send(ws_sock, &pkt, sizeof(pkt), 0) == sizeof(pkt)) {
-            last_state = state;
-            pkt_seq++;
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN || errno == EINPROGRESS || errno == EALREADY) {
-        } else {
-            ESP_LOGW(TAG, "send_key errno=%d (%s), closing", errno, strerror(errno));
-            close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-        }
+        pkt.dur_ms = state ? 0 : (uint32_t)((now_us - udp_tx_on_us) / 1000);
+        pkt.seq = udp_tx_seq++;
+        if (state) udp_tx_on_us = now_us;
+        struct sockaddr_in dest = {};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons((uint16_t)cfg.remote_port);
+        inet_pton(AF_INET, (const char*)cfg.remote_ip, &dest.sin_addr);
+        sendto(udp_tx_sock, &pkt, sizeof(pkt), 0,
+               (struct sockaddr*)&dest, sizeof(dest));
     }
 
     // Chiudi socket se non più in ruolo TX
-    if (cfg.role != 1 && ws_sock >= 0) {
-        close(ws_sock);
-        ws_sock = -1;
-        tcp_state = 0;
+    if (cfg.role != 1 && udp_tx_sock >= 0) {
+        close(udp_tx_sock);
+        udp_tx_sock = -1;
         last_state = false;
-        pkt_seq = 0;
+        udp_tx_seq = 0;
     }
 }
 
@@ -260,8 +246,8 @@ static void settings_load(void) {
     }
 
     int32_t v_wpm = cfg.wpm, v_mode = cfg.mode, v_byp = cfg.bypass;
-    int32_t v_vol = cfg.volume, v_role = cfg.role;
-    int32_t v_disp = cfg.display_enabled, v_jbl = cfg.jb_latency;
+    int32_t v_vol = cfg.volume, v_role = cfg.role, v_port = cfg.remote_port;
+    int32_t v_disp = cfg.display_enabled;
     char v_ip[16]; strcpy(v_ip, (const char*)cfg.remote_ip);
 
     nvs_get_i32(h, NVS_KEY_WPM, &v_wpm);
@@ -269,8 +255,8 @@ static void settings_load(void) {
     nvs_get_i32(h, NVS_KEY_BYPASS, &v_byp);
     nvs_get_i32(h, NVS_KEY_VOL, &v_vol);
     nvs_get_i32(h, NVS_KEY_ROLE, &v_role);
+    nvs_get_i32(h, NVS_KEY_PORT, &v_port);
     nvs_get_i32(h, NVS_KEY_DISP, &v_disp);
-    nvs_get_i32(h, NVS_KEY_JBLAT, &v_jbl);
 
     size_t len = sizeof(v_ip);
     nvs_get_str(h, NVS_KEY_IP, v_ip, &len);
@@ -298,16 +284,16 @@ static void settings_load(void) {
     if (v_vol < 0 || v_vol > 10) v_vol = 5;
     if (v_byp < 0) v_byp = 0;
     if (v_role < 0 || v_role > 2) v_role = 0;
+    if (v_port < 1 || v_port > 65535) v_port = 7373;
     if (v_disp < 0) v_disp = 0;
-    if (v_jbl < 50 || v_jbl > 1000) v_jbl = 200;
 
     cfg.wpm = v_wpm; cfg.mode = v_mode; cfg.bypass = v_byp;
-    cfg.volume = v_vol; cfg.role = v_role;
-    cfg.display_enabled = v_disp; cfg.jb_latency = v_jbl;
+    cfg.volume = v_vol; cfg.role = v_role; cfg.remote_port = v_port;
+    cfg.display_enabled = v_disp;
     strcpy((char*)cfg.remote_ip, v_ip);
 
     dot_length_us = (1200000 / cfg.wpm);
-    ESP_LOGI(TAG, "Loaded: WPM=%ld MODE=%ld VOL=%ld BYP=%ld ROLE=%ld DISP=%ld JBLAT=%ld",
+    ESP_LOGI(TAG, "Loaded: WPM=%ld MODE=%ld VOL=%ld BYP=%ld ROLE=%ld DISP=%ld",
              (long)cfg.wpm, (long)cfg.mode, (long)cfg.volume, (long)cfg.bypass, (long)cfg.role,
              (long)cfg.display_enabled);
 }
@@ -317,15 +303,15 @@ static void settings_save(void) {
     if (nvs_open("keyer", NVS_READWRITE, &h) != ESP_OK) return;
 
     int32_t v_wpm = cfg.wpm, v_mode = cfg.mode, v_byp = cfg.bypass;
-    int32_t v_vol = cfg.volume, v_role = cfg.role;
+    int32_t v_vol = cfg.volume, v_role = cfg.role, v_port = cfg.remote_port;
 
     nvs_set_i32(h, NVS_KEY_WPM, v_wpm);
     nvs_set_i32(h, NVS_KEY_MODE, v_mode);
     nvs_set_i32(h, NVS_KEY_BYPASS, v_byp);
     nvs_set_i32(h, NVS_KEY_VOL, v_vol);
     nvs_set_i32(h, NVS_KEY_ROLE, v_role);
+    nvs_set_i32(h, NVS_KEY_PORT, v_port);
     nvs_set_i32(h, NVS_KEY_DISP, cfg.display_enabled);
-    nvs_set_i32(h, NVS_KEY_JBLAT, cfg.jb_latency);
     nvs_set_str(h, NVS_KEY_IP, (const char*)cfg.remote_ip);
 
     // Salva credenziali WiFi STA
@@ -356,7 +342,7 @@ static void play_element(int multiplier) {
         esp_task_wdt_reset();
         if (gpio_get_level(PIN_DOT) == 0) dot_memory = true;
         if (gpio_get_level(PIN_DASH) == 0) dash_memory = true;
-        vTaskDelay(1);
+        taskYIELD();
     }
 
     send_key(false);
@@ -366,7 +352,7 @@ static void play_element(int multiplier) {
         esp_task_wdt_reset();
         if (gpio_get_level(PIN_DOT) == 0) dot_memory = true;
         if (gpio_get_level(PIN_DASH) == 0) dash_memory = true;
-        vTaskDelay(1);
+        taskYIELD();
     }
 
     last_sent_was_dot = (multiplier == 1);
@@ -395,13 +381,6 @@ static void keyer_task(void *arg) {
 
     while (1) {
         esp_task_wdt_reset();
-
-        // RX mode: paddle locale ignorato, l'output arriva via TCP
-        if (cfg.role == 2) {
-            vTaskDelay(pdMS_TO_TICKS(10));
-            continue;
-        }
-
         hb_counter++;
         if (hb_counter % 100 == 0) {
             ESP_LOGI(TAG, "KEYER ALIVE: mode=%ld wpm=%ld vol=%ld byp=%ld tick=%lld",
@@ -409,105 +388,19 @@ static void keyer_task(void *arg) {
                      (long long)esp_timer_get_time());
         }
 
+        // RX mode: paddle locale ignorato, l'output arriva via UDP
+        if (cfg.role == 2) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+
         now = esp_timer_get_time();
-
-        // WS reconnect: solo se WiFi connesso con IP
-        if (net_ready && sta_got_ip && cfg.role == 1 && ws_sock < 0) {
-            if (now > tcp_retry_us) {
-                tcp_retry_us = now + 3000000;
-                int sock = socket(AF_INET, SOCK_STREAM, 0);
-                if (sock >= 0) {
-                    int flags = fcntl(sock, F_GETFL, 0);
-                    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-                    int nodelay = 1;
-                    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-                    struct sockaddr_in dest = {};
-                    dest.sin_family = AF_INET;
-                    dest.sin_port = htons(7373);
-                    inet_pton(AF_INET, (const char*)cfg.remote_ip, &dest.sin_addr);
-                    int ret = connect(sock, (struct sockaddr*)&dest, sizeof(dest));
-                    ESP_LOGI(TAG, "TCP connect(%s:7373) ret=%d errno=%d %s",
-                             (const char*)cfg.remote_ip,
-                             ret, errno, ret==0?"OK":(ret<0&&errno==EINPROGRESS?"EINPROGRESS":strerror(errno)));
-                    if (ret == 0 || (ret < 0 && errno == EINPROGRESS)) {
-                        ws_sock = sock;
-                        tcp_connect_us = esp_timer_get_time();
-                        tcp_state = 1;
-                    } else {
-                        close(sock);
-                    }
-                }
-            }
-        }
-
-        // Poll WS socket (solo durante handshake, non quando connesso)
-        if (cfg.role == 1 && ws_sock >= 0) {
-            if (tcp_state != 3) {
-            struct pollfd pfd = {}; pfd.fd = ws_sock;
-            if (tcp_state == 1) pfd.events = POLLOUT;
-            else if (tcp_state == 2) pfd.events = POLLOUT | POLLIN;
-            int pr = poll(&pfd, 1, 0);
-            if (pr > 0 && (pfd.revents & (POLLERR|POLLHUP))) {
-                ESP_LOGW(TAG, "TCP POLLERR/POLLHUP, closing");
-                close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-            } else if (pr > 0 && (pfd.revents & POLLOUT) && tcp_state == 1) {
-                ESP_LOGI(TAG, "TCP connected to %s:7373", (const char*)cfg.remote_ip);
-                tcp_state = 3;
-                ws_sync_pending = true;
-                int keepalive = 1;
-                setsockopt(ws_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-                int idle = 1, intvl = 1, cnt = 2;
-                setsockopt(ws_sock, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-                setsockopt(ws_sock, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-                setsockopt(ws_sock, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-            } else if (pr == 0) {
-                int so_err = 0; socklen_t sl = sizeof(so_err);
-                if (getsockopt(ws_sock, SOL_SOCKET, SO_ERROR, &so_err, &sl) == 0 && so_err != 0) {
-                    ESP_LOGW(TAG, "WS SO_ERROR=%d (%s)", so_err, strerror(so_err));
-                    close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-                } else if (now - tcp_connect_us > 15000000) {
-                    ESP_LOGW(TAG, "TCP connect timeout 15s");
-                    close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-                }
-            } else if (pr < 0) {
-                ESP_LOGW(TAG, "WS poll error pr=%d", pr);
-                close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-            }
-            } else if (tcp_state == 3) {
-                static int health_cnt = 0;
-                if (++health_cnt >= 100) {
-                    health_cnt = 0;
-                    struct pollfd pfd = {}; pfd.fd = ws_sock; pfd.events = POLLIN;
-                    int pr = poll(&pfd, 1, 0);
-                    if (pr > 0 && (pfd.revents & (POLLERR|POLLHUP))) {
-                        ESP_LOGW(TAG, "TCP health: connection lost");
-                        close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-                    } else if (pr == 0) {
-                        int so_err = 0; socklen_t sl = sizeof(so_err);
-                        if (getsockopt(ws_sock, SOL_SOCKET, SO_ERROR, &so_err, &sl) == 0 && so_err != 0) {
-                            ESP_LOGW(TAG, "TCP health: SO_ERROR=%d", so_err);
-                            close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
-                        }
-                    }
-                }
-            }
-        } else {
-            tcp_state = 0;
-        }
-
         dot_length_us = (1200000 / cfg.wpm);
 
         bool dot_pressed = (gpio_get_level(PIN_DOT) == 0);
         bool dash_pressed = (gpio_get_level(PIN_DASH) == 0);
         if (dot_pressed || dash_pressed) last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
         int32_t cur_mode = cfg.mode;
-
-        // Se il modo cambia, forza OFF per resettare last_state in send_key
-        static int32_t prev_mode = -1;
-        if (cur_mode != prev_mode) {
-            prev_mode = cur_mode;
-            send_key(false);
-        }
 
         // ============================================================
         // STRAIGHT MODE
@@ -549,7 +442,6 @@ static void keyer_task(void *arg) {
             switch (curr_elt) {
                 case ELT_IDLE:
                     send_key(false);
-                    vTaskDelay(1);
                     idle_since = now;
                     if (dot_pressed && !dash_pressed) {
                         curr_elt = ELT_DOT;
@@ -567,7 +459,6 @@ static void keyer_task(void *arg) {
                 case ELT_DOT:
                     send_key(true);
                     if (dash_pressed) next_elt = ELT_DASH;
-                    else next_elt = ELT_IDLE;
                     if (now >= curr_elt_end_time) {
                         last_elt = ELT_DOT;
                         curr_elt = ELT_DELAY;
@@ -580,7 +471,6 @@ static void keyer_task(void *arg) {
                 case ELT_DASH:
                     send_key(true);
                     if (dot_pressed) next_elt = ELT_DOT;
-                    else next_elt = ELT_IDLE;
                     if (now >= curr_elt_end_time) {
                         last_elt = ELT_DASH;
                         curr_elt = ELT_DELAY;
@@ -606,7 +496,12 @@ static void keyer_task(void *arg) {
                     }
                     break;
             }
-            vTaskDelay(1);
+            // IDLE: delay per CPU; attivo: taskYIELD per precisione
+            if (curr_elt == ELT_IDLE) {
+                vTaskDelay(1);
+            } else {
+                taskYIELD();
+            }
             continue;
         }
 
@@ -623,12 +518,18 @@ static void keyer_task(void *arg) {
             } else if (!dot_pressed && !dot_memory) {
                 send_key(false);
             }
-            vTaskDelay(1);
+            // idle: delay per CPU; attivo: taskYIELD per precisione
+            if (dot_pressed || dash_pressed || dot_memory) {
+                taskYIELD();
+            } else {
+                vTaskDelay(1);
+            }
             continue;
         }
+
+        vTaskDelay(1);
     }
 }
-
 
 // ============================================================
 // MENU / BUTTONS TASK
@@ -651,11 +552,10 @@ static void menu_task(void *arg) {
         // Decrementa timer messaggio "Saved!"
         if (disp_saved_timer > 0) disp_saved_timer--;
 
-        // Aggiornamento periodico display (ogni ~1s se WS connesso, sennò ~100ms)
+        // Aggiornamento periodico display (~100ms, flush ~26ms @400kHz)
         if (disp_dev) {
             disp_counter++;
-            int disp_rate = ws_client_connected ? 100 : 10;
-            if (disp_counter >= disp_rate) {
+            if (disp_counter >= 10) {
                 disp_counter = 0;
                 disp_redraw();
             }
@@ -1097,7 +997,7 @@ static void disp_draw_str(int px, int py, const char *str) {
 static void disp_redraw(void) {
     if (disp_sleeping) return;
     disp_clear();
-    char buf[24];
+    char buf[20];
     if (disp_saved_timer > 0) {
         disp_draw_str(36, 20, "SAVED!");
         disp_flush();
@@ -1105,18 +1005,10 @@ static void disp_redraw(void) {
     }
     const char *modes[] = {"STRAIGHT", "IAMBIC A", "IAMBIC B", "BUG-SIM"};
     if (disp_show_ip && sta_got_ip && sta_ip_str[0]) {
-        // Pagina IP all'avvio
-        bool online = (cfg.role == 1) ? (tcp_state == 3) : ws_client_connected;
+        // 5 righe compatte: mostra IP all'avvio
         snprintf(buf, sizeof(buf), "MOD:%s", modes[cfg.mode >= 0 && cfg.mode <= 3 ? cfg.mode : 0]);
         disp_draw_str(0, 0, buf);
-        if (cfg.role == 1) {
-            snprintf(buf, sizeof(buf), "%s %s", cfg.bypass ? "[PRACTICE]" : "[ONLINE]", online ? "O" : "--");
-        } else if (cfg.role == 2) {
-            snprintf(buf, sizeof(buf), "%s", cfg.bypass ? "[PRACTICE]" : "[RX]");
-        } else {
-            snprintf(buf, sizeof(buf), "%s", cfg.bypass ? "[PRACTICE]" : "[STD]");
-        }
-        disp_draw_str(0, 12, buf);
+        disp_draw_str(0, 12, cfg.bypass ? "TX:PRACTICE" : "TX:ONLINE");
         snprintf(buf, sizeof(buf), "SPD:%ldWPM", (long)cfg.wpm);
         disp_draw_str(0, 24, buf);
         if (cfg.volume == 0) snprintf(buf, sizeof(buf), "VOL:OFF");
@@ -1125,34 +1017,14 @@ static void disp_redraw(void) {
         snprintf(buf, sizeof(buf), "IP:%-15s", sta_ip_str);
         disp_draw_str(0, 48, buf);
     } else {
-        // Pagina 1 (dopo aver nascosto IP)
-        bool online = (cfg.role == 1) ? (tcp_state == 3) : ws_client_connected;
-
-        // Riga 0: MOD
+        // 4 righe classiche (16px spaziatura)
         snprintf(buf, sizeof(buf), "MOD: %s", modes[cfg.mode >= 0 && cfg.mode <= 3 ? cfg.mode : 0]);
         disp_draw_str(0, 0, buf);
-
-        // Riga 1: TX/RX ONLINE o BYP + indicatore connessione a destra
-        if (cfg.role == 1) {
-            snprintf(buf, sizeof(buf), "%s", cfg.bypass ? "TX:[PRACTICE]" : "TX:[ONLINE]");
-        } else if (cfg.role == 2) {
-            snprintf(buf, sizeof(buf), "%s", cfg.bypass ? "RX:[PRACTICE]" : "RX:[ONLINE]");
-        } else {
-            snprintf(buf, sizeof(buf), "%s", cfg.bypass ? "[PRACTICE]" : "[STD]");
-        }
-        disp_draw_str(0, 16, buf);
-        if (online) {
-            // Pallino pieno all'estrema destra
-            for (int c = 118; c <= 124; c++) fb[c + 2 * 128] |= 0x3F;
-        }
-
-        // Riga 2: SPEED
+        disp_draw_str(0, 16, cfg.bypass ? "TX: [PRACTICE]" : "TX: [ONLINE]");
         snprintf(buf, sizeof(buf), "SPEED: %ld WPM", (long)cfg.wpm);
         disp_draw_str(0, 32, buf);
-
-        // Riga 3: VOL
-        if (cfg.volume == 0) snprintf(buf, sizeof(buf), "VOL: OFF");
-        else                snprintf(buf, sizeof(buf), "VOL: %ld / 10", (long)cfg.volume);
+        if (cfg.volume == 0) snprintf(buf, sizeof(buf), "VOL:   OFF");
+        else                snprintf(buf, sizeof(buf), "VOL:   %ld / 10", (long)cfg.volume);
         disp_draw_str(0, 48, buf);
     }
     disp_flush();
@@ -1194,18 +1066,12 @@ input,select{width:100%;padding:10px;border:none;border-radius:8px;font-size:16p
 <option value="1">ON (practice)</option>
 </select>
 <div class="row"><label>Role</label><span class="val" id="v_role">...</span></div>
-<select name="r" onchange="v_role.textContent=['Standalone','TX','RX'][this.value];autoSave()">
+<select name="r" onchange="v_role.textContent=['Standalone','TX (sends UDP)','RX (receives UDP)'][this.value];autoSave()">
 <option value="0">Standalone</option>
-<option value="1">TX</option>
-<option value="2">RX</option>
+<option value="1">TX (sends UDP)</option>
+<option value="2">RX (receives UDP)</option>
 </select>
-<div id="jblat_section">
-<div class="row"><label>RX Latency</label><span class="val" id="v_jbl">...</span></div>
-<input type="range" name="j" min="50" max="1000" value="200" oninput="v_jbl.textContent=this.value+'ms';autoSave()">
-</div>
 <div class="row"><label>STA IP (WiFi)</label><span class="val" id="v_staip">not connected</span></div>
-<div class="row"><label>TCP Link</label><span class="val" id="v_tcp" style="font-size:14px">...</span></div>
-<button id="reconnect_btn" onclick="reconnect()" style="width:100%;padding:8px;border:none;border-radius:8px;font-size:14px;background:#00adb5;color:#fff;margin:4px 0;cursor:pointer">⟳ Reconnect</button>
 </div>
 <div id="info"></div>
 <div id="wifi_status" style="font-size:13px;color:#aaa;margin:4px 0"></div>
@@ -1219,8 +1085,7 @@ var q='w='+document.querySelector('[name="w"]').value;
 q+='&l='+document.querySelector('[name="l"]').value;
 q+='&m='+document.querySelector('[name="m"]').value;
 q+='&b='+document.querySelector('[name="b"]').value;
-	q+='&r='+document.querySelector('[name="r"]').value;
-	q+='&j='+document.querySelector('[name="j"]').value;
+q+='&r='+document.querySelector('[name="r"]').value;
 fetch('/save?'+q).then(function(r){return r.text()}).then(function(){
 document.getElementById('info').textContent='Saved at '+new Date().toLocaleTimeString();
 });
@@ -1231,23 +1096,10 @@ document.querySelector('[name="w"]').value=d.w; v_wpm.textContent=d.w;
 document.querySelector('[name="l"]').value=d.l; v_vol.textContent=d.l;
 document.querySelector('[name="m"]').value=d.m; v_mode.textContent=['STRAIGHT','IAMBIC A','IAMBIC B','BUG'][d.m];
 document.querySelector('[name="b"]').value=d.b; v_byp.textContent=d.b?'ON (practice)':'OFF (TX active)';
-document.querySelector('[name="r"]').value=d.r; v_role.textContent=['Standalone','TX','RX'][d.r];
-document.getElementById('jblat_section').style.display=(d.r==2)?'':'none';
-	if(document.querySelector('[name="j"]')){document.querySelector('[name="j"]').value=d.jblat;v_jbl.textContent=d.jblat+'ms';}
+document.querySelector('[name="r"]').value=d.r; v_role.textContent=['Standalone','TX (sends UDP)','RX (receives UDP)'][d.r];
 var sts=document.getElementById('wifi_status');
 if(d.stai) sts.innerHTML='Connected to <b>'+d.stai+'</b> ('+d.staip+')';
 else sts.innerHTML='Not connected to any WiFi';
-var tcpLabels=['Disconnected','Connecting...','Upgrading...','Connected'];
-var tcpColors=['#ff4444','#ffaa00','#ffaa00','#4caf50'];
-var tcpEl=document.getElementById('v_tcp');
-if(tcpEl){tcpEl.textContent=tcpLabels[d.tcp]||'?';tcpEl.style.color=tcpColors[d.tcp]||'#fff';}
-var btn=document.getElementById('reconnect_btn');
-if(btn)btn.style.display=(d.r==1)?'':'none';
-}
-function reconnect(){
-var btn=document.getElementById('reconnect_btn');
-if(btn){btn.textContent='⟳ Reconnecting...';btn.disabled=true;}
-fetch('/reconnect?'+Date.now()).then(function(){setTimeout(function(){if(btn){btn.textContent='⟳ Reconnect';btn.disabled=false;}},1000);});
 }
 fetch('/status?'+Date.now()).then(r=>r.json()).then(function(d){
 updateUI(d); document.getElementById('info').textContent='Ready';
@@ -1269,7 +1121,7 @@ static esp_err_t web_root_handler(httpd_req_t *req) {
 }
 
 static esp_err_t web_status_handler(httpd_req_t *req) {
-    char buf[1536];
+    char buf[768];
     // Campi STA connessione
     char sta_json[256];
     if (sta_got_ip)
@@ -1284,48 +1136,15 @@ static esp_err_t web_status_handler(httpd_req_t *req) {
         pos += snprintf(ssid_json + pos, sizeof(ssid_json) - pos,
                         ",\"s%d\":\"%s\"", i, sta_creds[i].ssid);
     int len = snprintf(buf, sizeof(buf),
-        "{\"w\":%ld,\"l\":%ld,\"m\":%ld,\"b\":%ld,\"r\":%ld,\"i\":\"%s\",\"jblat\":%ld,"
-        "\"tcp\":%d,"
-        "%s%s}",
+        "{\"w\":%ld,\"l\":%ld,\"m\":%ld,\"b\":%ld,\"r\":%ld,\"i\":\"%s\",\"p\":%ld,%s%s}",
         (long)cfg.wpm, (long)cfg.volume, (long)cfg.mode,
         (long)cfg.bypass, (long)cfg.role,
-        (const char*)cfg.remote_ip, (long)cfg.jb_latency,
-        (int)(cfg.role == 2 ? (ws_client_connected ? 3 : 0) : tcp_state),
+        (const char*)cfg.remote_ip, (long)cfg.remote_port,
         sta_json, ssid_json);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_send(req, buf, len);
     return ESP_OK;
-}
-
-static esp_err_t web_reconnect_handler(httpd_req_t *req) {
-    if (cfg.role == 1 && ws_sock >= 0) {
-        close(ws_sock);
-        ws_sock = -1;
-    }
-    tcp_retry_us = 0; // resetta timer per reconnect immediato
-    tcp_state = 0;
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, "OK", 2);
-    return ESP_OK;
-}
-
-// URL-decode in-place (gestisce %XX e +)
-static void url_decode(char *s) {
-    char *r = s;
-    while (*s) {
-        if (*s == '%' && s[1] && s[2]) {
-            char hex[3] = {s[1], s[2], 0};
-            *r++ = (char)strtol(hex, NULL, 16);
-            s += 3;
-        } else if (*s == '+') {
-            *r++ = ' ';
-            s++;
-        } else {
-            *r++ = *s++;
-        }
-    }
-    *r = 0;
 }
 
 static esp_err_t web_save_handler(httpd_req_t *req) {
@@ -1356,9 +1175,9 @@ static esp_err_t web_save_handler(httpd_req_t *req) {
         if (httpd_query_key_value(qbuf, "i", tmp, sizeof(tmp)) == ESP_OK) {
             strcpy((char*)cfg.remote_ip, tmp);
         }
-        if (httpd_query_key_value(qbuf, "j", tmp, sizeof(tmp)) == ESP_OK) {
+        if (httpd_query_key_value(qbuf, "p", tmp, sizeof(tmp)) == ESP_OK) {
             int v = atoi(tmp);
-            if (v >= 50 && v <= 1000) cfg.jb_latency = v;
+            if (v >= 1 && v <= 65535) cfg.remote_port = v;
         }
 
         // Legge credenziali WiFi STA (merge: sovrascrive solo gli slot inviati)
@@ -1370,13 +1189,11 @@ static esp_err_t web_save_handler(httpd_req_t *req) {
             char key[8];
             snprintf(key, sizeof(key), "s%d", i);
             if (httpd_query_key_value(qbuf, key, tmp, sizeof(tmp)) == ESP_OK && strlen(tmp) > 0) {
-                url_decode(tmp);
                 bool ssid_changed = (strcmp(merged_creds[i].ssid, tmp) != 0);
                 if (ssid_changed) wifi_changed = true;
                 strcpy(merged_creds[i].ssid, tmp);
                 snprintf(key, sizeof(key), "p%d", i);
                 if (httpd_query_key_value(qbuf, key, pwd, sizeof(pwd)) == ESP_OK) {
-                    url_decode(pwd);
                     // Password esplicitamente inviata (anche vuota)
                     if (strlen(pwd) > 0 || ssid_changed) {
                         if (strcmp(merged_creds[i].password, pwd) != 0) wifi_changed = true;
@@ -1469,12 +1286,13 @@ button{background:#00adb5;color:#fff;border:none;padding:10px 20px;border-radius
 <div class="row"><label>Password</label><span class="val" id="v_auth"></span></div>
 <input type="password" id="pwd" placeholder="Leave empty for open networks">
 <div id="portal_note" style="font-size:12px;color:#ff9800;display:none">⚠ Open network with captive portal? Connect your phone first, accept terms, then come back and save.</div>
-<button onclick="saveWiFi()" style="background:#4caf50">💾 Save WiFi</button>
 </div>
 <div class="card">
 <h4 style="margin:0 0 8px 0;color:#00adb5">Remote Keying</h4>
 <div class="row"><label>Remote IP</label><span class="val" id="v_ip">...</span></div>
 <input type="text" id="remote_ip" placeholder="192.168.1.100">
+<div class="row"><label>Remote Port</label><span class="val" id="v_port">...</span></div>
+<input type="number" id="remote_port" min="1" max="65535" value="7373">
 <button onclick="saveRemote()" style="background:#4caf50">💾 Save Remote</button>
 </div>
 <div class="card">
@@ -1543,20 +1361,10 @@ fetch('/save?'+q).then(r=>r.text()).then(function(){});
 }
 function saveRemote(){
 var ip=document.getElementById('remote_ip').value.trim();
+var pt=document.getElementById('remote_port').value;
 if(!ip){alert('Enter Remote IP');return;}
-fetch('/save?i='+encodeURIComponent(ip)).then(r=>r.text()).then(function(m){
-document.getElementById('info').textContent='Remote IP saved';
-});
-}
-function selectNet(idx){
-fetch('/selwifi?idx='+idx).then(function(r){return r.text()}).then(function(){
-document.getElementById('info').textContent='Connecting to slot '+idx+'...';
-});
-}
-function delNet(idx){
-if(!confirm('Delete this network?')) return;
-fetch('/delwifi?idx='+idx).then(function(r){return r.text()}).then(function(){
-document.getElementById('info').textContent='Network deleted';
+fetch('/save?i='+encodeURIComponent(ip)+'&p='+pt).then(r=>r.text()).then(function(m){
+document.getElementById('info').textContent='Remote settings saved';
 });
 }
 setInterval(function(){
@@ -1566,17 +1374,19 @@ var html='';
 for(var i=0;i<4;i++){
 var key='s'+i;
 if(d[key]&&d[key]!=''){
-html+='<div class="row" style="cursor:pointer" onclick="selectNet('+i+')"><label>'+(i+1)+'.</label><span class="val">'+d[key]+'</span><button onclick="event.stopPropagation();delNet('+i+')" style="background:#c0392b;padding:2px 8px;font-size:12px">✕</button></div>';
+html+='<div class="row"><label>'+(i+1)+'.</label><span class="val">'+d[key]+'</span></div>';
 }
 }
 sl.innerHTML=html||'<div class="row" style="color:#888;font-size:13px">No networks saved</div>';
 if(d.stai) document.getElementById('scan_status').textContent='Connected to '+d.stai+' ('+d.staip+')';
 if(document.getElementById('v_ip')) document.getElementById('v_ip').textContent=d.i||'-';
+if(document.getElementById('v_port')) document.getElementById('v_port').textContent=d.p||'7373';
 });
 },3000);
 // Pre-fill Remote IP/Port al caricamento (non in poll per non interferire con la digitazione)
 fetch('/status?'+Date.now()).then(r=>r.json()).then(function(d){
 if(document.getElementById('remote_ip')) document.getElementById('remote_ip').value=d.i||'';
+if(document.getElementById('remote_port')) document.getElementById('remote_port').value=d.p||'7373';
 });
 </script>
 </body></html>)rawliteral";
@@ -1643,60 +1453,6 @@ static esp_err_t web_catchall_handler(httpd_req_t *req) {
     httpd_resp_set_hdr(req, "Location", "http://192.168.4.1/");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
     httpd_resp_sendstr(req, "");
-    return ESP_OK;
-}
-
-// Tap su rete salvata: connetti immediatamente
-static void sta_connect_to_index(int idx);
-static bool sta_manual_selection = false;
-static esp_err_t web_selwifi_handler(httpd_req_t *req) {
-    char qbuf[64];
-    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
-        char tmp[8];
-        if (httpd_query_key_value(qbuf, "idx", tmp, sizeof(tmp)) == ESP_OK) {
-            int idx = atoi(tmp);
-            if (idx >= 0 && idx < sta_cred_count) {
-                sta_manual_selection = true;
-                sta_connect_to_index(idx);
-                httpd_resp_set_type(req, "text/plain");
-                httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-                httpd_resp_sendstr(req, "OK");
-                return ESP_OK;
-            }
-        }
-    }
-    httpd_resp_sendstr(req, "ERROR");
-    return ESP_OK;
-}
-
-// Cancella rete WiFi salvata
-static esp_err_t web_delwifi_handler(httpd_req_t *req) {
-    char qbuf[64];
-    if (httpd_req_get_url_query_str(req, qbuf, sizeof(qbuf)) == ESP_OK) {
-        char tmp[8];
-        if (httpd_query_key_value(qbuf, "idx", tmp, sizeof(tmp)) == ESP_OK) {
-            int idx = atoi(tmp);
-            if (idx >= 0 && idx < MAX_STA_NETS && strlen(sta_creds[idx].ssid) > 0) {
-                bool was_current = sta_connected && strcmp(sta_ssid_connected, sta_creds[idx].ssid) == 0;
-                for (int i = idx; i < MAX_STA_NETS - 1; i++) {
-                    strcpy(sta_creds[i].ssid, sta_creds[i+1].ssid);
-                    strcpy(sta_creds[i].password, sta_creds[i+1].password);
-                }
-                sta_creds[MAX_STA_NETS-1].ssid[0] = 0;
-                sta_creds[MAX_STA_NETS-1].password[0] = 0;
-                if (sta_cred_count > 0) sta_cred_count--;
-                settings_save();
-                if (was_current) {
-                    esp_wifi_disconnect();
-                }
-                httpd_resp_set_type(req, "text/plain");
-                httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
-                httpd_resp_sendstr(req, "OK");
-                return ESP_OK;
-            }
-        }
-    }
-    httpd_resp_sendstr(req, "ERROR");
     return ESP_OK;
 }
 
@@ -1808,7 +1564,7 @@ static void beacon_task(void *arg) {
 
     while (1) {
         msg[0] = 0;
-        int pos = snprintf(msg, sizeof(msg), "C6_KEYER;name=ESP32Keyer;staip=%s;role=%ld;mode=%s",
+        int pos = snprintf(msg, sizeof(msg), "C6_KEYER;name=esp32-keyer;staip=%s;role=%ld;mode=%s",
                            sta_got_ip ? sta_ip_str : "0.0.0.0",
                            (long)cfg.role, modes[cfg.mode >= 0 && cfg.mode <= 3 ? cfg.mode : 0]);
         (void)pos;
@@ -1822,10 +1578,9 @@ static void beacon_task(void *arg) {
 // ============================================================
 static esp_netif_t *ap_netif = NULL;
 static esp_netif_t *sta_netif = NULL;
-int sta_ap_index = 0;
+static int sta_ap_index = 0;
 
 static void sta_connect_to_index(int idx) {
-    sta_ap_index = idx;
     wifi_config_t sta_cfg;
     memset(&sta_cfg, 0, sizeof(sta_cfg));
     strcpy((char*)sta_cfg.sta.ssid, sta_creds[idx].ssid);
@@ -1835,12 +1590,7 @@ static void sta_connect_to_index(int idx) {
     sta_cfg.sta.threshold.rssi = -127;
     sta_cfg.sta.failure_retry_cnt = 3;
     esp_wifi_set_config(WIFI_IF_STA, &sta_cfg);
-    if (sta_connected) {
-        sta_manual_selection = true;
-        esp_wifi_disconnect();
-    } else {
-        esp_wifi_connect();
-    }
+    esp_wifi_connect();
 }
 
 static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, void *data) {
@@ -1848,14 +1598,8 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
         if (id == WIFI_EVENT_STA_START) {
             if (sta_cred_count > 0) {
                 sta_ap_index = 0;
-                while (sta_ap_index < sta_cred_count && strlen(sta_creds[sta_ap_index].ssid) == 0)
-                    sta_ap_index++;
-                if (sta_ap_index < sta_cred_count) {
-                    ESP_LOGI(TAG, "WiFi STA started, connecting to %s...", sta_creds[sta_ap_index].ssid);
-                    sta_connect_to_index(sta_ap_index);
-                } else {
-                    ESP_LOGW(TAG, "WiFi STA started, all slots empty");
-                }
+                ESP_LOGI(TAG, "WiFi STA started, connecting to %s...", sta_creds[0].ssid);
+                esp_wifi_connect();
             } else {
                 ESP_LOGI(TAG, "WiFi STA started, no credentials configured");
             }
@@ -1869,13 +1613,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
             sta_connected = false;
             sta_got_ip = false;
             sta_ip_str[0] = 0;
-            if (ws_sock >= 0) { close(ws_sock); ws_sock = -1; tcp_state = 0; }
-            if (sta_manual_selection) {
-                sta_manual_selection = false;
-                ESP_LOGI(TAG, "WiFi STA disconnected (manual selection), connecting to %s...",
-                         sta_creds[sta_ap_index].ssid);
-                esp_wifi_connect();
-            } else if (sta_cred_count > 1) {
+            if (sta_cred_count > 1) {
                 sta_ap_index = (sta_ap_index + 1) % sta_cred_count;
                 ESP_LOGW(TAG, "WiFi STA disconnected, trying %s (idx=%d)...",
                          sta_creds[sta_ap_index].ssid, sta_ap_index);
@@ -1888,7 +1626,6 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t*)data;
         sta_got_ip = true;
-        tcp_retry_us = 0;
         snprintf(sta_ip_str, sizeof(sta_ip_str), IPSTR, IP2STR(&e->ip_info.ip));
         ESP_LOGI(TAG, "WiFi STA got IP: %s", sta_ip_str);
     }
@@ -1910,7 +1647,6 @@ static void wifi_apsta_init(void) {
     // Crea netif per AP e STA
     ap_netif = esp_netif_create_default_wifi_ap();
     sta_netif = esp_netif_create_default_wifi_sta();
-    esp_netif_set_hostname(sta_netif, "ESP32Keyer");
 
     wifi_init_config_t w_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&w_cfg);
@@ -1922,12 +1658,10 @@ static void wifi_apsta_init(void) {
     esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL);
     esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL);
 
-    // Config AP (sempre attivo - nome include ruolo per distinguere TX/RX)
+    // Config AP (sempre attivo)
     wifi_config_t ap_cfg;
     memset(&ap_cfg, 0, sizeof(ap_cfg));
-    if (cfg.role == 1)      strcpy((char*)ap_cfg.ap.ssid, "C6_KEYER-TX");
-    else if (cfg.role == 2) strcpy((char*)ap_cfg.ap.ssid, "C6_KEYER-RX");
-    else                    strcpy((char*)ap_cfg.ap.ssid, "C6_KEYER");
+    strcpy((char*)ap_cfg.ap.ssid, "C6_KEYER");
     ap_cfg.ap.authmode = WIFI_AUTH_OPEN;
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.channel = 6;
@@ -1936,16 +1670,12 @@ static void wifi_apsta_init(void) {
     wifi_config_t sta_cfg;
     memset(&sta_cfg, 0, sizeof(sta_cfg));
     if (sta_cred_count > 0) {
-        int first = 0;
-        while (first < sta_cred_count && strlen(sta_creds[first].ssid) == 0) first++;
-        if (first < sta_cred_count) {
-            strcpy((char*)sta_cfg.sta.ssid, sta_creds[first].ssid);
-            strcpy((char*)sta_cfg.sta.password, sta_creds[first].password);
-            sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
-            sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
-            sta_cfg.sta.threshold.rssi = -127;
-            sta_cfg.sta.failure_retry_cnt = 3;
-        }
+        strcpy((char*)sta_cfg.sta.ssid, sta_creds[0].ssid);
+        strcpy((char*)sta_cfg.sta.password, sta_creds[0].password);
+        sta_cfg.sta.scan_method = WIFI_FAST_SCAN;
+        sta_cfg.sta.sort_method = WIFI_CONNECT_AP_BY_SIGNAL;
+        sta_cfg.sta.threshold.rssi = -127;
+        sta_cfg.sta.failure_retry_cnt = 3;
     }
 
     ret = esp_wifi_set_mode(WIFI_MODE_APSTA);
@@ -1962,8 +1692,6 @@ static void wifi_apsta_init(void) {
     ret = esp_wifi_start();
     if (ret != ESP_OK) { ESP_LOGE(TAG, "wifi start failed: %d", ret); return; }
 
-    esp_wifi_set_ps(WIFI_PS_NONE);
-
     // Verifica AP: stampa l'IP dell'interfaccia AP
     esp_netif_ip_info_t ap_ip;
     if (esp_netif_get_ip_info(ap_netif, &ap_ip) == ESP_OK)
@@ -1971,16 +1699,15 @@ static void wifi_apsta_init(void) {
     else
         ESP_LOGW(TAG, "AP IP not available");
 
-    ESP_LOGI(TAG, "WiFi APSTA: AP=%s (ch=6) STA=%s",
-             ap_cfg.ap.ssid,
+    ESP_LOGI(TAG, "WiFi APSTA: AP=C6_KEYER (ch=6) STA=%s",
              sta_cred_count > 0 ? sta_creds[0].ssid : "(none)");
 }
 
 static void web_server_init(void) {
     httpd_config_t srv_cfg = HTTPD_DEFAULT_CONFIG();
-    srv_cfg.max_uri_handlers = 12;
-    srv_cfg.stack_size = 8192;
-    srv_cfg.recv_wait_timeout = 30;
+    srv_cfg.max_uri_handlers = 10;
+    srv_cfg.lru_purge_enable = true;
+    srv_cfg.stack_size = 4096;
 
     httpd_handle_t server = NULL;
     esp_err_t ret = httpd_start(&server, &srv_cfg);
@@ -2034,15 +1761,6 @@ static void web_server_init(void) {
         ESP_LOGE(TAG, "register /scan failed");
     }
 
-    httpd_uri_t u_rec = {};
-    u_rec.uri = "/reconnect";
-    u_rec.method = HTTP_GET;
-    u_rec.handler = web_reconnect_handler;
-    u_rec.user_ctx = NULL;
-    if (httpd_register_uri_handler(server, &u_rec) != ESP_OK) {
-        ESP_LOGE(TAG, "register /reconnect failed");
-    }
-
     httpd_uri_t u_catch = {};
     u_catch.uri = "/*";
     u_catch.method = HTTP_GET;
@@ -2052,195 +1770,109 @@ static void web_server_init(void) {
         ESP_LOGE(TAG, "register /* (catchall) failed");
     }
 
-    httpd_uri_t u_sel = {};
-    u_sel.uri = "/selwifi";
-    u_sel.method = HTTP_GET;
-    u_sel.handler = web_selwifi_handler;
-    u_sel.user_ctx = NULL;
-    if (httpd_register_uri_handler(server, &u_sel) != ESP_OK) {
-        ESP_LOGE(TAG, "register /selwifi failed");
-    }
-
-    httpd_uri_t u_del = {};
-    u_del.uri = "/delwifi";
-    u_del.method = HTTP_GET;
-    u_del.handler = web_delwifi_handler;
-    u_del.user_ctx = NULL;
-    if (httpd_register_uri_handler(server, &u_del) != ESP_OK) {
-        ESP_LOGE(TAG, "register /delwifi failed");
-    }
-
     ESP_LOGI(TAG, "HTTP server ready on port %d", srv_cfg.server_port);
 }
 
 
-// ============================================================
-// Raw TCP server task: ascolta su 7373, riceve pacchetti CW
-// Nessun WS, nessun HTTP, solo 8 byte per pacchetto.
-// Non blocca mai l'HTTP server (task separato).
-// ============================================================
-static void tcp_rx_task(void *arg) {
-    int listen_sock = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
-    setsockopt(listen_sock, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+static void udp_rx_task(void *arg) {
+    int port = (int)(intptr_t)arg;
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGE(TAG, "UDP RX socket failed");
+        vTaskDelete(NULL);
+    }
+
     struct sockaddr_in addr = {};
     addr.sin_family = AF_INET;
-    addr.sin_port = htons(7373);
+    addr.sin_port = htons(port);
     addr.sin_addr.s_addr = INADDR_ANY;
-    if (bind(listen_sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        ESP_LOGE(TAG, "TCP server bind failed on 7373");
-        close(listen_sock); vTaskDelete(NULL); return;
+    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        ESP_LOGE(TAG, "UDP RX bind failed port %d", port);
+        close(sock);
+        vTaskDelete(NULL);
     }
-    listen(listen_sock, 1);
-    ESP_LOGI(TAG, "TCP server listening on port 7373");
 
-    while (1) {
-        struct sockaddr_in client_addr;
-        socklen_t clen = sizeof(client_addr);
-        int fd = accept(listen_sock, (struct sockaddr*)&client_addr, &clen);
-        if (fd < 0) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
-
-        ESP_LOGI(TAG, "TCP client connected on fd=%d port 7373", fd);
-        int keepalive = 1;
-        int idle = 1, intvl = 1, cnt = 2;
-        setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
-        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
-        ws_client_connected = true;
-
-        uint8_t buf[sizeof(cw_packet_t)];
-        while (1) {
-            int got = 0;
-            while (got < (int)sizeof(buf)) {
-                int n = recv(fd, buf + got, sizeof(buf) - got, 0);
-                if (n > 0) { got += n; continue; }
-                if (n == 0) break;
-                if (errno == EAGAIN || errno == EWOULDBLOCK) { if (got == 0) break; continue; }
-                break;
-            }
-            if (got != sizeof(buf)) {
-                if (got == 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                break;
-            }
-            if (rx_pkt_queue) {
-                cw_packet_t pkt;
-                memcpy(&pkt, buf, sizeof(pkt));
-                if (xQueueSend(rx_pkt_queue, &pkt, 0) != pdTRUE) {
-                    ESP_LOGW(TAG, "TCP rx queue full");
-                }
-            }
-        }
-        ws_client_connected = false;
-        close(fd);
-        ESP_LOGI(TAG, "TCP client disconnected from port 7373");
-    }
-}
-
-// ============================================================
-// JITTER BUFFER RX TASK (legge da coda TCP)
-// ============================================================
-#define JB_SIZE 32
-
-typedef struct {
-    uint8_t type;     // 1=ON, 0=OFF
-    int64_t abs_us;   // tempo assoluto (esp_timer) in cui eseguire
-    uint8_t seq;
-    bool used;
-} jb_entry_t;
-
-static void net_rx_task(void *arg) {
-    jb_entry_t jb[JB_SIZE] = {};
-    int64_t jb_base_time = 0;
-    int64_t jb_base_ts = -1;
-    bool jb_key_on = false;
-    int64_t jb_last_pkt_us = 0;
+    // Timeout 10ms: bilancia reattività e carico CPU
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
     esp_task_wdt_add(NULL);
+    ESP_LOGI(TAG, "UDP RX listening on port %d", port);
+
+    uint16_t pending_dur_ms = 0;
+    int64_t rx_on_time = 0;
+    int64_t scheduled_off = 0;
+    bool key_on = false;
 
     while (1) {
         esp_task_wdt_reset();
+        cw_packet_t pkt;
+        struct sockaddr_in from;
+        socklen_t fromlen = sizeof(from);
+        int len = recvfrom(sock, &pkt, sizeof(pkt), 0,
+                          (struct sockaddr*)&from, &fromlen);
+
         int64_t now = esp_timer_get_time();
 
-        // Drena la coda completamente (processa tutti i pacchetti disponibili)
-        cw_packet_t pkt;
-        while (rx_pkt_queue && xQueueReceive(rx_pkt_queue, &pkt, 0) == pdTRUE) {
-            jb_last_pkt_us = now;
-
-            if (jb_base_ts < 0) { jb_base_time = now; jb_base_ts = pkt.ts_ms; }
-            int64_t ts_diff = (int64_t)(pkt.ts_ms - (uint32_t)jb_base_ts);
-            int64_t abs_us = jb_base_time + ts_diff * 1000 + (int64_t)cfg.jb_latency * 1000;
-
-            int slot = -1;
-            for (int i = 0; i < JB_SIZE; i++) { if (!jb[i].used) { slot = i; break; } }
-            if (slot < 0) {
-                int64_t oldest = INT64_MAX;
-                for (int i = 0; i < JB_SIZE; i++) {
-                    if (jb[i].used && jb[i].abs_us < oldest) { oldest = jb[i].abs_us; slot = i; }
-                }
-            }
-            if (slot >= 0) {
-                jb[slot].type = pkt.type; jb[slot].abs_us = abs_us;
-                jb[slot].seq = pkt.seq; jb[slot].used = true;
-            }
+        // Controlla se è ora di spegnere
+        if (key_on && scheduled_off > 0 && now >= scheduled_off) {
+            key_on = false;
+            scheduled_off = 0;
+            send_key(false);
         }
 
-        // Processa JB
-        while (1) {
-            int best = -1;
-            int64_t best_us = INT64_MAX;
-            for (int i = 0; i < JB_SIZE; i++) {
-                if (jb[i].used && jb[i].abs_us <= now && jb[i].abs_us < best_us) {
-                    best = i; best_us = jb[i].abs_us;
+        if (len == sizeof(pkt)) {
+            if (pkt.type == 1) {
+                // ON: accendi subito, ignora se già acceso (duplicato)
+                if (!key_on) {
+                    key_on = true;
+                    send_key(true);
+                    rx_on_time = esp_timer_get_time();
+                    // Se c'era una durata in sospeso (OFF arrivato prima di ON), usala
+                    if (pending_dur_ms > 0) {
+                        scheduled_off = rx_on_time + (int64_t)pending_dur_ms * 1000;
+                        pending_dur_ms = 0;
+                    } else {
+                        scheduled_off = 0;
+                    }
                 }
-            }
-            if (best < 0) break;
-            if (jb[best].type == 1) {
-                if (jb_key_on) send_key(false); // micro-gap
-                jb_key_on = true;
-                send_key(true);
             } else {
-                if (jb_key_on) {
-                    jb_key_on = false;
-                    send_key(false);
+                // OFF: usa dur_ms dal pacchetto
+                uint16_t dur = pkt.dur_ms;
+                if (dur == 0) dur = 60; // fallback
+                if (key_on && rx_on_time > 0) {
+                    scheduled_off = rx_on_time + (int64_t)dur * 1000;
+                    if (scheduled_off <= now) {
+                        key_on = false;
+                        scheduled_off = 0;
+                        send_key(false);
+                    }
+                } else {
+                    // OFF senza ON precedente (fuori ordine): salva durata
+                    pending_dur_ms = dur;
                 }
             }
-            jb[best].used = false;
         }
-
-        // Inattivita 3s: reset
-        if (jb_last_pkt_us > 0 && now - jb_last_pkt_us > 3000000) {
-            if (jb_key_on) { jb_key_on = false; send_key(false); }
-            jb_base_time = 0; jb_base_ts = -1;
-            memset(jb, 0, sizeof(jb));
-            jb_last_pkt_us = 0;
-        }
-
-        // Stuck key recovery
-        // Stuck key recovery: 10s per non tagliare linee lunghe
-        int64_t key_timeout = 10000000;
-        if (jb_key_on && jb_last_pkt_us > 0 && now - jb_last_pkt_us > key_timeout) {
-            jb_key_on = false; send_key(false);
-        }
-
-        vTaskDelay(1);
     }
+
 }
 
-static void net_init(void) {
+static void udp_init(void) {
     if (cfg.role == 1) {
-        // TX: TCP reconnect gestito da keyer_task
-    } else if (cfg.role == 2) {
-        rx_pkt_queue = xQueueCreate(256, sizeof(cw_packet_t));
-        if (!rx_pkt_queue) ESP_LOGE(TAG, "rx_pkt_queue create failed");
-        else {
-            xTaskCreate(net_rx_task, "net_rx", 8192, NULL, 6, NULL);
-            xTaskCreate(tcp_rx_task, "tcp_rx", 4096, NULL, 4, NULL);
+        udp_tx_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (udp_tx_sock >= 0) {
+            struct timeval tv = { .tv_sec = 0, .tv_usec = 1000 };
+            setsockopt(udp_tx_sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         }
+        ESP_LOGI(TAG, "UDP TX ready -> %s:%ld",
+                 (const char*)cfg.remote_ip, (long)cfg.remote_port);
+    } else if (cfg.role == 2) {
+        // RX: task di ricezione
+        xTaskCreate(udp_rx_task, "udp_rx", 4096,
+                    (void*)(intptr_t)cfg.remote_port, 5, NULL);
+    } else {
+        ESP_LOGI(TAG, "UDP disabled (role=0 standalone)");
     }
-    net_ready = true;
 }
 
 // ============================================================
@@ -2292,21 +1924,19 @@ extern "C" void app_main(void) {
     xTaskCreate(menu_task, "menu", 4096, NULL, 2, NULL);
     ESP_LOGI(TAG, "Menu task created (prio=2)");
 
-    // 9. WiFi AP+STA + Web Server (solo DNS/beacon su TX)
+    // 9. WiFi AP+STA + Web Server
     wifi_apsta_init();
     web_server_init();
-    if (cfg.role == 1) {
-        xTaskCreate(dns_server_task, "dns", 2048, NULL, 3, NULL);
-        xTaskCreate(beacon_task, "beacon", 2048, NULL, 1, NULL);
-    }
+    xTaskCreate(dns_server_task, "dns", 2048, NULL, 3, NULL);
+    xTaskCreate(beacon_task, "beacon", 2048, NULL, 1, NULL);
     mdns_init();
-    mdns_hostname_set("ESP32Keyer");
+    mdns_hostname_set("esp32-keyer");
     mdns_instance_name_set("C6 Keyer");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     ESP_LOGI(TAG, "WiFi AP+STA + Web Server + DNS + mDNS ready");
 
-    // 10. TCP (TX connect o RX listen in base al ruolo)
-    net_init();
+    // 10. UDP (TX o RX in base al ruolo)
+    udp_init();
 
     ESP_LOGI(TAG, "Ready. MODE=%s WPM=%ld VOL=%ld BYP=%ld",
              cfg.mode == 0 ? "STRAIGHT" : cfg.mode == 1 ? "IAMBIC A" :

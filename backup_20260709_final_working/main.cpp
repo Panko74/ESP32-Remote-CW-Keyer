@@ -211,7 +211,31 @@ static int64_t tcp_connect_us = 0; // qnd è iniziato il tentativo di connect (p
 // RX: coda per pacchetti ricevuti via WebSocket (net_rx_task la consuma)
 static QueueHandle_t rx_pkt_queue = NULL;
 static volatile bool ws_client_connected = false;
-static volatile bool ws_sync_pending = false;
+
+// Debug counters (atomic per evitare warning -Wvolatile su C++17)
+static volatile uint32_t dbg_tx_total;
+static volatile uint32_t dbg_tx_sendto_ok;
+static volatile uint32_t dbg_tx_sendto_fail;
+static volatile uint32_t dbg_rx_total;
+static volatile uint32_t dbg_jb_in;
+static volatile uint32_t dbg_jb_out;
+static volatile uint32_t dbg_jb_drop;
+
+// Event log per debug lato RX
+#define EVT_LOG_SIZE 64
+typedef struct { int64_t abs_us; uint8_t seq; uint8_t type; } evt_entry_t;
+static evt_entry_t evt_log[EVT_LOG_SIZE];
+static volatile int evt_log_pos;
+
+#define EVT_LOG(t,s,n) do { \
+    int _i = __atomic_fetch_add(&evt_log_pos, 1, __ATOMIC_RELAXED) % EVT_LOG_SIZE; \
+    evt_log[_i].abs_us = (n); \
+    evt_log[_i].seq = (s); \
+    evt_log[_i].type = (t); \
+} while(0)
+
+#define DBG_INC(x) __atomic_fetch_add(&(x), 1, __ATOMIC_RELAXED)
+#define DBG_ADD(x,v) __atomic_fetch_add(&(x), (v), __ATOMIC_RELAXED)
 
 static void send_key(bool state) {
     static bool last_state = false;
@@ -220,8 +244,7 @@ static void send_key(bool state) {
     radio_out(state);
 
     // TX via TCP: invia cambio stato se ruolo=TX, bypass=OFF e connesso
-    if (cfg.role == 1 && cfg.bypass == 0 && tcp_state == 3 && (state != last_state || ws_sync_pending)) {
-        ws_sync_pending = false;
+    if (cfg.role == 1 && cfg.bypass == 0 && tcp_state == 3 && state != last_state) {
         cw_packet_t pkt;
         pkt.type = state ? 1 : 0;
         int64_t now_us = esp_timer_get_time();
@@ -229,12 +252,17 @@ static void send_key(bool state) {
         pkt.dur_ms = state ? 0 : (uint32_t)((now_us - key_start_us) / 1000);
         pkt.seq = pkt_seq;
         if (state) key_start_us = now_us;
+        DBG_INC(dbg_tx_total);
         if (send(ws_sock, &pkt, sizeof(pkt), 0) == sizeof(pkt)) {
             last_state = state;
             pkt_seq++;
+            ESP_LOGI(TAG, "TX>%c seq=%d", pkt.type ? '+' : '-', pkt.seq);
+            DBG_INC(dbg_tx_sendto_ok);
         } else if (errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOTCONN || errno == EINPROGRESS || errno == EALREADY) {
+            DBG_INC(dbg_tx_sendto_fail);
         } else {
             ESP_LOGW(TAG, "send_key errno=%d (%s), closing", errno, strerror(errno));
+            DBG_INC(dbg_tx_sendto_fail);
             close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
         }
     }
@@ -453,7 +481,6 @@ static void keyer_task(void *arg) {
             } else if (pr > 0 && (pfd.revents & POLLOUT) && tcp_state == 1) {
                 ESP_LOGI(TAG, "TCP connected to %s:7373", (const char*)cfg.remote_ip);
                 tcp_state = 3;
-                ws_sync_pending = true;
                 int keepalive = 1;
                 setsockopt(ws_sock, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
                 int idle = 1, intvl = 1, cnt = 2;
@@ -466,7 +493,7 @@ static void keyer_task(void *arg) {
                     ESP_LOGW(TAG, "WS SO_ERROR=%d (%s)", so_err, strerror(so_err));
                     close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
                 } else if (now - tcp_connect_us > 15000000) {
-                    ESP_LOGW(TAG, "TCP connect timeout 15s");
+                    ESP_LOGW(TAG, "WS connect timeout 15s");
                     close(ws_sock); ws_sock = -1; tcp_state = 0; tcp_retry_us = 0;
                 }
             } else if (pr < 0) {
@@ -501,13 +528,6 @@ static void keyer_task(void *arg) {
         bool dash_pressed = (gpio_get_level(PIN_DASH) == 0);
         if (dot_pressed || dash_pressed) last_activity_ms = (uint32_t)(esp_timer_get_time() / 1000);
         int32_t cur_mode = cfg.mode;
-
-        // Se il modo cambia, forza OFF per resettare last_state in send_key
-        static int32_t prev_mode = -1;
-        if (cur_mode != prev_mode) {
-            prev_mode = cur_mode;
-            send_key(false);
-        }
 
         // ============================================================
         // STRAIGHT MODE
@@ -1283,14 +1303,35 @@ static esp_err_t web_status_handler(httpd_req_t *req) {
     for (int i = 0; i < MAX_STA_NETS && pos < (int)sizeof(ssid_json) - 48; i++)
         pos += snprintf(ssid_json + pos, sizeof(ssid_json) - pos,
                         ",\"s%d\":\"%s\"", i, sta_creds[i].ssid);
+    // Event log (ultimi EVT_LOG_SIZE eventi suonati)
+    char evt_str[512] = "";
+    int epos = 0;
+    int ecnt = evt_log_pos;
+    int estart = ecnt > EVT_LOG_SIZE ? ecnt - EVT_LOG_SIZE : 0;
+    int64_t base = 0;
+    for (int i = estart; i < ecnt && epos < (int)sizeof(evt_str) - 12; i++) {
+        evt_entry_t *e = &evt_log[i % EVT_LOG_SIZE];
+        if (base == 0) base = e->abs_us;
+        int ms = (int)((e->abs_us - base) / 1000);
+        epos += snprintf(evt_str + epos, sizeof(evt_str) - epos,
+                         "%c%d@%d ", e->type ? '+' : '-', e->seq, ms);
+    }
     int len = snprintf(buf, sizeof(buf),
         "{\"w\":%ld,\"l\":%ld,\"m\":%ld,\"b\":%ld,\"r\":%ld,\"i\":\"%s\",\"jblat\":%ld,"
         "\"tcp\":%d,"
+        "\"txtot\":%lu,\"txok\":%lu,\"txfail\":%lu,\"rxtot\":%lu,"
+        "\"jbin\":%lu,\"jbout\":%lu,\"jbdrop\":%lu,"
+        "\"log\":\"%s\","
         "%s%s}",
         (long)cfg.wpm, (long)cfg.volume, (long)cfg.mode,
         (long)cfg.bypass, (long)cfg.role,
         (const char*)cfg.remote_ip, (long)cfg.jb_latency,
         (int)(cfg.role == 2 ? (ws_client_connected ? 3 : 0) : tcp_state),
+        (unsigned long)dbg_tx_total,
+        (unsigned long)dbg_tx_sendto_ok, (unsigned long)dbg_tx_sendto_fail,
+        (unsigned long)dbg_rx_total,
+        (unsigned long)dbg_jb_in, (unsigned long)dbg_jb_out, (unsigned long)dbg_jb_drop,
+        evt_str,
         sta_json, ssid_json);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
@@ -1808,7 +1849,7 @@ static void beacon_task(void *arg) {
 
     while (1) {
         msg[0] = 0;
-        int pos = snprintf(msg, sizeof(msg), "C6_KEYER;name=ESP32Keyer;staip=%s;role=%ld;mode=%s",
+        int pos = snprintf(msg, sizeof(msg), "C6_KEYER;name=esp32-keyer;staip=%s;role=%ld;mode=%s",
                            sta_got_ip ? sta_ip_str : "0.0.0.0",
                            (long)cfg.role, modes[cfg.mode >= 0 && cfg.mode <= 3 ? cfg.mode : 0]);
         (void)pos;
@@ -1910,7 +1951,6 @@ static void wifi_apsta_init(void) {
     // Crea netif per AP e STA
     ap_netif = esp_netif_create_default_wifi_ap();
     sta_netif = esp_netif_create_default_wifi_sta();
-    esp_netif_set_hostname(sta_netif, "ESP32Keyer");
 
     wifi_init_config_t w_cfg = WIFI_INIT_CONFIG_DEFAULT();
     ret = esp_wifi_init(&w_cfg);
@@ -1975,6 +2015,8 @@ static void wifi_apsta_init(void) {
              ap_cfg.ap.ssid,
              sta_cred_count > 0 ? sta_creds[0].ssid : "(none)");
 }
+
+static esp_err_t ws_handler(httpd_req_t *req);
 
 static void web_server_init(void) {
     httpd_config_t srv_cfg = HTTPD_DEFAULT_CONFIG();
@@ -2070,6 +2112,16 @@ static void web_server_init(void) {
         ESP_LOGE(TAG, "register /delwifi failed");
     }
 
+    httpd_uri_t u_ws = {};
+    u_ws.uri = "/ws";
+    u_ws.method = HTTP_GET;
+    u_ws.handler = ws_handler;
+    u_ws.user_ctx = NULL;
+    u_ws.is_websocket = true;
+    if (httpd_register_uri_handler(server, &u_ws) != ESP_OK) {
+        ESP_LOGE(TAG, "register /ws failed");
+    }
+
     ESP_LOGI(TAG, "HTTP server ready on port %d", srv_cfg.server_port);
 }
 
@@ -2121,10 +2173,7 @@ static void tcp_rx_task(void *arg) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) { if (got == 0) break; continue; }
                 break;
             }
-            if (got != sizeof(buf)) {
-                if (got == 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
-                break;
-            }
+            if (got != sizeof(buf)) break;
             if (rx_pkt_queue) {
                 cw_packet_t pkt;
                 memcpy(&pkt, buf, sizeof(pkt));
@@ -2140,7 +2189,14 @@ static void tcp_rx_task(void *arg) {
 }
 
 // ============================================================
-// JITTER BUFFER RX TASK (legge da coda TCP)
+// WebSocket handler (HTTP server) - stub, non più usato
+// ============================================================
+static esp_err_t ws_handler(httpd_req_t *req) {
+    return ESP_OK;
+}
+
+// ============================================================
+// JITTER BUFFER RX TASK (legge da coda WS)
 // ============================================================
 #define JB_SIZE 32
 
@@ -2168,6 +2224,7 @@ static void net_rx_task(void *arg) {
         cw_packet_t pkt;
         while (rx_pkt_queue && xQueueReceive(rx_pkt_queue, &pkt, 0) == pdTRUE) {
             jb_last_pkt_us = now;
+            DBG_INC(dbg_rx_total);
 
             if (jb_base_ts < 0) { jb_base_time = now; jb_base_ts = pkt.ts_ms; }
             int64_t ts_diff = (int64_t)(pkt.ts_ms - (uint32_t)jb_base_ts);
@@ -2184,6 +2241,7 @@ static void net_rx_task(void *arg) {
             if (slot >= 0) {
                 jb[slot].type = pkt.type; jb[slot].abs_us = abs_us;
                 jb[slot].seq = pkt.seq; jb[slot].used = true;
+                DBG_INC(dbg_jb_in);
             }
         }
 
@@ -2201,10 +2259,14 @@ static void net_rx_task(void *arg) {
                 if (jb_key_on) send_key(false); // micro-gap
                 jb_key_on = true;
                 send_key(true);
+                DBG_INC(dbg_jb_out);
+                EVT_LOG(1, jb[best].seq, now);
             } else {
                 if (jb_key_on) {
                     jb_key_on = false;
                     send_key(false);
+                    DBG_INC(dbg_jb_out);
+                    EVT_LOG(0, jb[best].seq, now);
                 }
             }
             jb[best].used = false;
@@ -2219,8 +2281,8 @@ static void net_rx_task(void *arg) {
         }
 
         // Stuck key recovery
-        // Stuck key recovery: 10s per non tagliare linee lunghe
-        int64_t key_timeout = 10000000;
+        int64_t key_timeout = dot_length_us * 4 + 500000;
+        if (key_timeout < 500000) key_timeout = 500000;
         if (jb_key_on && jb_last_pkt_us > 0 && now - jb_last_pkt_us > key_timeout) {
             jb_key_on = false; send_key(false);
         }
@@ -2300,7 +2362,7 @@ extern "C" void app_main(void) {
         xTaskCreate(beacon_task, "beacon", 2048, NULL, 1, NULL);
     }
     mdns_init();
-    mdns_hostname_set("ESP32Keyer");
+    mdns_hostname_set("esp32-keyer");
     mdns_instance_name_set("C6 Keyer");
     mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0);
     ESP_LOGI(TAG, "WiFi AP+STA + Web Server + DNS + mDNS ready");
