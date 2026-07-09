@@ -317,6 +317,10 @@ cd ESP32RemoteKeyer
 pio run -t upload
 ```
 
+## Future implementazioni
+- Pubblicazione dello schema dei collegamenti
+- DNS dinamico per provider internet senza IP pubblico statico 
+
 ## Licenza
 
 MIT
