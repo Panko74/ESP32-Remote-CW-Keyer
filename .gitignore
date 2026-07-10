@@ -14,3 +14,6 @@ backup_20260709_final_working/
 BAK/
 src/main.cpp.bak
 Note.txt
+
+# Schema PCB (non necessario per il firmware)
+schema/ESP32Keyer/
