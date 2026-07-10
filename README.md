@@ -1,326 +1,435 @@
-# ESP32-C6 Remote Keyer v1.0.0
+# ESP32-C6 Remote Keyer
 
-**Trasmettitore/Ricevitore CW remoto via TCP su ESP32-C6**
+> Remote CW keyer over Internet using ESP32-C6 and raw TCP transport.
 
-Coppia di dispositivi ESP32-C6 che permettono di azionare un tasto telegrafico CW in remoto via Internet. Il TX (collegato al paddle/bug/tasto verticale) invia i punti e le linee via TCP all'RX (collegato alla radio), che li riproduce su radio tramite l'ingresso Key (in modalità tasto verticale), fedelmente, con lo stesso timing e "firma" della trasmissione.
-Latenza impostabile da 0 a 1000ms (default 100ms).
-Il sidetone del TX è in locale su buzzer, per una perfetta sincronia dell'ascolto con la manipolazione.
+![ESP32-C6](https://img.shields.io/badge/ESP32--C6-WiFi6-blue)
+![PlatformIO](https://img.shields.io/badge/PlatformIO-supported-orange)
+![License](https://img.shields.io/badge/License-MIT-green)
 
-> Due dispositivi identici. Il ruolo (TX/RX/Standalone) si assegna via web UI.
+Operate your CW station remotely while preserving your exact keying style, timing and fist.
 
----
+The system consists of two ESP32-C6 devices:
 
-## Architettura
+- **TX Unit** connected to a paddle, bug or straight key
+- **RX Unit** connected to the radio key input
 
-```
-┌──────────────┐    TCP raw      ┌─────────────┐
-│  TX (paddle) │───porta 7373──▶│  RX (radio) │
-│   hotspot    │                 │  IP fisso   │
-│   telefono   │                 │  router     │
-└──────────────┘                 └─────────────┘
-```
+The transmitter sends keying events over the Internet using a lightweight TCP protocol. The receiver reproduces them in real time on the radio, preserving the original rhythm and characteristics of the operator.
 
-- **TX**: si connette via TCP all'IP pubblico dell'RX, porta **7373**
-- **RX**: server TCP su porta **7373**, task separato dall'HTTP server
-- **Trasporto**: TCP raw, nessuna dipendenza WebSocket
-- **Server HTTP** su porta **80**: web UI sempre reattiva (non bloccata dal traffico CW)
+No Morse decoding. No character transmission. No CW regeneration.
+
+Just your keying — remotely.
 
 ---
 
-## Requisiti hardware
+## 📡 Features
 
-- 2x ESP32-C6-DevKitC-1 (o ESP32-C6 compatibile)
-- Paddle/Bug/Tasto verticale telegrafico (per il TX)
-- Buzzer o radio (per l'RX)
-- Display SSD1306 I2C 128×64 (per entrambi)
-- Resistenze pull-up I2C 4.7kΩ (se il display non le ha integrate)
-- Alimentazione USB (power bank, caricatore, porta PC) o con BMS interno per batteria Li 3,7V.
-- Router con IP pubblico statico (rete dell'RX)
-- Telefono cellulare con hotspot (per il TX)
+✅ Remote CW over TCP/IP
 
----
+✅ Straight Key, Iambic A, Iambic B and Bug modes
 
-## Collegamenti (pinout)
+✅ Preserves original operator timing ("fist")
 
-```
-ESP32-C6-DevKitC-1
-┌────────────────────────┐
-│ GPIO 2  ── Paddle DOT  │
-│ GPIO 3  ── Paddle DASH │
-│ GPIO 4  ── WPM +       │
-│ GPIO 5  ── WPM −       │
-│ GPIO 6  ── MODE        │
-│ GPIO 7  ── OUT RADIO   │
-│ GPIO 10 ── BYPASS      │
-│ GPIO 15 ── BUZZER      │
-│ GPIO 18 ── SDA (I2C)   │
-│ GPIO 19 ── SCL (I2C)   │
-└────────────────────────┘
-```
+✅ Adjustable latency buffer (0–1000 ms)
 
-| Pin | Funzione | Note |
-|-----|----------|------|
-| GPIO 2 | Paddle DOT | Input pull-up interno, GND = premuto |
-| GPIO 3 | Paddle DASH | Input pull-up interno, GND = premuto |
-| GPIO 4 | WPM UP | Input pull-up, GND = premuto |
-| GPIO 5 | WPM DOWN | Input pull-up, GND = premuto |
-| GPIO 6 | MODE | Input pull-up, GND = premuto |
-| GPIO 7 | OUT RADIO | Uscita, tramite optoisolatore TLP504A verso l'ingresso Key della radio, settato in modalità tasto verticale |
-| GPIO 10 | BYPASS | Input pull-up, GND = premuto |
-| GPIO 15 | BUZZER | Uscita PWM 600Hz, pilotare con transistor se necessario |
-| GPIO 18 | I2C SDA | Display SSD1306 |
-| GPIO 19 | I2C SCL | Display SSD1306 |
+✅ OLED SSD1306 support
 
-> Il display è opzionale. Se non rilevato all'avvio, il dispositivo funziona comunque (solo web UI).
+✅ Built-in Web UI
+
+✅ WiFi 6 capable ESP32-C6 platform
+
+✅ TX / RX / Standalone operating modes
+
+✅ Configuration stored in NVS
+
+✅ Smartphone hotspot compatible
+
+✅ Local sidetone for perfect operator feedback
+
+✅ TCP keepalive and automatic reconnection
 
 ---
 
-## Prima configurazione
+## 🏗 Architecture
 
-### 1. Flash del firmware
+```mermaid
+flowchart LR
 
-Scarica l'ultima release da GitHub. Con PlatformIO:
+    PADDLE[Paddle / Bug / Straight Key]
+    TX[ESP32-C6 TX]
+    NET[(Internet)]
+    RX[ESP32-C6 RX]
+    RADIO[Radio Transceiver]
+
+    PADDLE --> TX
+    TX -->|TCP Port 7373| NET
+    NET -->|TCP Port 7373| RX
+    RX --> RADIO
+```
+
+### TX Unit
+
+- Reads paddle/key inputs
+- Generates local sidetone
+- Sends timing information via TCP
+- Can operate through smartphone hotspot
+
+### RX Unit
+
+- TCP server on port **7373**
+- Generates radio keying output
+- Independent HTTP configuration server
+- Fixed IP mandatory (at the moment)
+
+---
+
+## 📸 Screenshots
+
+### OLED Display
+
+<table>
+  <tr>
+    <td align="center"><a href="assets-screenshots/Oled.jpeg"><img src="assets-screenshots/Oled.jpeg" width="80%"></a><br><em>Oled</em></td>
+  </tr>
+</table>
+
+
+### Web UI
+
+<table>
+  <tr>
+    <td align="center"><a href="assets-screenshots/Home.jpeg"><img src="assets-screenshots/Home.jpeg" width="80%"></a><br><em>Home</em></td>
+    <td align="center"><a href="assets-screenshots/Network.jpeg"><img src="assets-screenshots/Network.jpeg" width="80%"></a><br><em>Network</em></td>
+  </tr>
+</table>
+
+
+---
+
+## ⚡ Quick Start
+
+| Step | Action |
+|--------|----------|
+| 1 | Flash firmware on both ESP32-C6 boards |
+| 2 | Connect each unit to WiFi |
+| 3 | Configure one device as RX |
+| 4 | Configure router port forwarding |
+| 5 | Configure second device as TX |
+| 6 | Start sending CW |
+
+---
+
+# 🔧 Hardware Requirements
+
+- 2 × ESP32-C6 DevKitC-1
+- Paddle, bug or straight key
+- Radio transceiver with key input
+- SSD1306 OLED display (optional)
+- USB power supply or battery pack
+- Internet connection
+- Router with public IP address (RX side)
+- Smartphone hotspot or other WiFi with port 7373 open and no captive portal (TX side)
+
+---
+
+# 📍 Pinout
+
+| GPIO | Function | Notes |
+|--------|----------|----------|
+| GPIO 2 | Paddle DOT | Internal pull-up |
+| GPIO 3 | Paddle DASH | Internal pull-up |
+| GPIO 4 | WPM UP | Internal pull-up |
+| GPIO 5 | WPM DOWN | Internal pull-up |
+| GPIO 6 | MODE | Internal pull-up |
+| GPIO 7 | RADIO OUTPUT | Via optocoupler/transistor, to radio Key input |
+| GPIO 10 | BYPASS | Internal pull-up |
+| GPIO 15 | BUZZER | PWM output |
+| GPIO 18 | I²C SDA | OLED display |
+| GPIO 19 | I²C SCL | OLED display |
+
+The OLED display is optional. The device operates normally without it.
+
+---
+
+# 🌐 Initial Configuration
+
+## 1. Flash Firmware
 
 ```bash
 # RX
-pio run -t upload --upload-port COM8 (o la COM del RX rilevata dal PC)
+
+pio run -t upload --upload-port COM8 (i.e.)
+
 # TX
-pio run -t upload --upload-port COM9 (o la COM del TX rilevata dal PC)
+
+pio run -t upload --upload-port COM9 (i.e.)
 ```
 
-Per la prima installazione su ESP vergine: può essere necessario tenere premuto il boot button mentre si collega l'USB.
-
-### 2. Connessione al WiFi
-
-Alla prima accensione (o dopo erase NVS), il ruolo è **Standalone** e l'AP ha nome generico:
-
-| Stato | Nome AP | IP AP |
-|-------|---------|-------|
-| Prima configurazione | `C6_KEYER` | 192.168.4.1 |
-| Dopo aver impostato Role=TX | `C6_KEYER-TX` | 192.168.4.1 |
-| Dopo aver impostato Role=RX | `C6_KEYER-RX` | 192.168.4.1 |
-
-1. Connettiti all'AP del dispositivo (telefono/PC)
-2. Apri browser a `http://192.168.4.1`
-3. Vai su **WiFi Network Settings**
-4. Clicca **Scan Networks**
-5. Seleziona la tua rete WiFi
-6. Inserisci password
-7. **Save WiFi**
-
-Il dispositivo si riavvia e si connette alla rete. L'AP rimane attivo per future riconfigurazioni.
-
-> **RX**: il dispositivo che starà presso la stazione radio va connesso alla **rete WiFi fissa** di quella postazione (la stessa su cui farai il port forwarding). Il TX invece può essere su qualsiasi rete (hotspot telefono, WiFi viaggio, ecc.).
-
-### 3. IP fisso per l'RX
-
-Accedi al router della rete dell'RX e trova il MAC del dispositivo tra i **dispositivi connessi** (cerca il nome `ESP32Keyer` o l'IP dell'RX). Imposta un **lease DHCP statico** associando il MAC all'IP desiderato. In questo modo, dopo ogni reboot, l'RX mantiene lo stesso IP.
-
-> Senza IP fisso, dopo un reboot l'RX potrebbe ricevere un IP diverso e il port forwarding smetterebbe di funzionare.
-
-### 4. Port forwarding sul router
-
-Sul router dell'RX aggiungi una regola di port forwarding:
-
-```
-Porta esterna: 7373 → IP_RX:7373 (TCP)
-```
-
-### 5. Assegnazione ruoli
-
-Dalla web UI di ciascun dispositivo (`http://192.168.4.1`):
-
-**RX**: imposta **Role = RX**, salva. Il dispositivo si riavvia in modalità RX e il server TCP su 7373 parte.
-
-**TX**: imposta **Role = TX**, **Remote IP** = IP pubblico del router dell'RX, salva. Il dispositivo si riavvia in modalità TX e si connette automaticamente all'RX.
-
-> Dopo il primo save, il dispositivo riavvia. L'AP potrebbe impiegare alcuni secondi a riapparire.
-
-### 6. Hotspot telefono per il TX
-
-Connetti il TX all'hotspot del telefono. Le reti mobili (TIM, Vodafone, Iliad, WINDTRE, ecc.) hanno:
-
-- **Porte in uscita**: generalmente aperte (il TX può connettersi all'RX)
-- **Porte in entrata**: generalmente chiuse (non serve, il TX non deve ricevere connessioni)
-
-> Se usi una saponetta 4G/5G al posto dell'hotspot, verifica che non blocchi le connessioni in uscita sulla porta 7373 e sulla 80.
+For a brand-new ESP32-C6, hold BOOT while connecting the USB cable if necessary.
 
 ---
 
-## Primo test
+## 2. Connect to WiFi
 
-1. Alimenta entrambi i dispositivi
-2. Attendi che il TX si connetta (display mostra `TX:[ONLINE] █`)
-3. Premi il paddle sul TX
-4. L'RX dovrebbe emettere il tono dal buzzer
+At first boot the device creates:
 
-Se non senti nulla:
-- Controlla che il **volume** non sia a 0 (MODE + WPM +/-)
-- Controlla che il **bypass** non sia attivo (premi BYPASS)
-- Controlla la connessione TCP (il rettangolo `█` deve essere visibile)
+```text
+SSID: C6_KEYER
+IP:   192.168.4.1
+```
+
+Open:
+
+```text
+http://192.168.4.1
+```
+
+Navigate to:
+
+```text
+WiFi Network Settings
+```
+
+Then:
+
+1. Scan Networks
+2. Select WiFi
+3. Enter password
+4. Save Configuration
+
+The device reboots and joins your WiFi network.
 
 ---
 
-## Uso
+## 3. Configure RX
 
-### Pulsanti
+Set:
 
-| Pulsante | Azione breve | Azione lunga (>1.5s) |
-|----------|-------------|---------------------|
-| **MODE** | Ciclo modi (STRAIGHT → IAMBIC A → IAMBIC B → BUG) | — |
-| **BYPASS** | Nasconde IP / attiva/disattiva bypass | **Salva impostazioni** (mostra "SAVED!") |
-| **WPM +** | Aumenta velocità (5-70 WPM) | — |
-| **WPM −** | Diminuisce velocità (5-70 WPM) | — |
-
-> **MODE + WPM +/-** tenuti insieme dopo aver premuto MODE: regolano il **volume** invece del modo.
-
-### Display OLED
-
-**Pagina IP** (al primo avvio o dopo reset NVS, mostra IP unica volta):
-```
-MOD:IAMBIC B
-[ONLINE] O
-SPD:30WPM
-VOL:5/10
-IP:192.168.0.50
+```text
+Role = RX
 ```
 
-**Pagina 1** (dopo prima pressione BYPASS):
+Assign a DHCP reservation or static lease on the router.
+
+Example:
+
+```text
+192.168.1.50
 ```
-MOD: IAMBIC B
-TX:[ONLINE]  █
-SPEED: 30 WPM
-VOL: 5 / 10
-```
-
-- `O` / `█`: indicatore di connessione attiva
-- `TX:[ONLINE]`: TX connesso all'RX
-- `TX:[PRACTICE]`: bypass attivo, non trasmette via radio
-- `RX:[ONLINE]`: RX in ascolto
-
-> Il display va in sleep dopo 15s di inattività. Qualsiasi pulsante lo riaccende.
-
-### Modi operativi
-
-| Modo | Descrizione |
-|------|-------------|
-| **STRAIGHT** | Tasto verticale.|
-| **IAMBIC A** | Auto punti e linee, squeeze = alternanza continua |
-| **IAMBIC B** | IAMBIC A con memoria |
-| **BUG** | Punti automatici (premi DOT), linee manuali (premi DASH) |
 
 ---
 
-## Web UI
+## 4. Configure Port Forwarding
 
-Ogni dispositivo ha una web UI completa sulla porta **80**:
+Forward TCP port:
 
-| URL | Funzione |
-|-----|----------|
-| `http://IP_DISPOSITIVO` | Controlli principali (WPM, volume, modo, bypass, ruolo) |
-| `http://IP_DISPOSITIVO/wifi` | Configurazione WiFi e IP remoto |
-| `http://IP_DISPOSITIVO/status` | JSON stato (per diagnostica) |
+```text
+7373 → RX_IP:7373
+```
 
-Per accedere via AP: `http://192.168.4.1`
+Example:
+
+```text
+7373 → 192.168.1.50:7373
+```
 
 ---
 
-## Diagnostica via seriale
+## 5. Configure TX
 
-Collega via USB e apri un monitor seriale (115200 baud):
+Set:
+
+```text
+Role = TX
+Remote IP = Public IP of RX router
+```
+
+Save and reboot.
+
+The TX automatically connects to the RX.
+
+---
+
+# 🎛 Operating Modes
+
+| Mode | Description |
+|--------|----------|
+| Straight | Traditional straight key |
+| Iambic A | Squeeze keying supported |
+| Iambic B | Iambic A with 1-bit memory |
+| Bug | Automatic dots, manual dashes |
+
+---
+
+# 🔘 Buttons
+
+| Button | Short Press | Long Press |
+|----------|------------|-------------|
+| MODE | Cycle keyer mode | — |
+| BYPASS | Toggle practice mode | Save settings |
+| WPM + | Increase speed | — |
+| WPM − | Decrease speed | — |
+
+### Volume Adjustment
+
+Press:
+
+```text
+MODE + WPM+
+MODE + WPM-
+```
+
+to change sidetone volume.
+
+---
+
+# 💻 Web Interface
+
+Every device provides a web interface.
+
+| URL | Purpose |
+|--------|----------|
+| / | Main controls |
+| /wifi | WiFi and network settings |
+| /status | JSON diagnostics |
+
+Examples:
+
+```text
+http://192.168.1.50
+```
+
+or
+
+```text
+http://192.168.4.1
+```
+
+when connected through AP mode.
+
+---
+
+# ⚙ How It Works
+
+The TX unit captures paddle events and immediately sends key-down/key-up timing information to the RX unit over a raw TCP connection.
+
+The receiver reproduces those events directly on the radio key input.
+
+Unlike CW-over-text solutions, this system:
+
+- Does not decode Morse characters
+- Does not regenerate Morse timing
+- Does not alter spacing
+- Does not modify weighting
+
+Therefore the transmitted CW retains the exact style ("fist") of the operator.
+
+---
+
+# 🔍 Diagnostics
+
+Serial Monitor:
 
 ```bash
-pio device monitor -p COM8 (o la COM rilevata dal PC) -b 115200
+pio device monitor -b 115200
 ```
 
-Il dispositivo stampa:
-- `TCP connect(...:7373) ret=... EINPROGRESS` → tentativo di connessione
-- `TCP connected to ...:7373` → connessione stabilita
-- `send_key errno=...` → errore di invio (seguito da riconnessione)
-- `WiFi STA disconnected` → WiFi perso, il dispositivo si riconnette
-- `TCP server listening on port 7373` → RX in ascolto
-- `TCP client connected on fd=...` → RX ha accettato una connessione
+Common messages:
 
-Per il debug avanzato, abilitare `CONFIG_LOG_DEFAULT_LEVEL_INFO` nel menuconfig.
-
----
-
-## Aggiornamento firmware
-
-Le impostazioni (WiFi, ruolo, IP remoto, ecc.) sono salvate in **NVS** e **non vengono perse** durante un normale flash. Per un aggiornamento:
-
-```bash
-# Aggiorna entrambi
-pio run -t upload --upload-port COM8 (o la COM del RX rilevata dal PC)
-pio run -t upload --upload-port COM9 (o la COM del TX rilevata dal PC)
-```
-
-Per resettare le impostazioni ai default (raro):
-
-```bash
-pio run -t erase --upload-port COM8 (o la COM rilevata dal PC)  # cancella TUTTO, NVS incluso
-pio run -t upload --upload-port COM8 (o la COM rilevata dal PC) # riflasha
+```text
+TCP connected
+TCP reconnecting
+WiFi STA disconnected
+TCP server listening on port 7373
+Client connected
 ```
 
 ---
 
-## Troubleshooting
+# 🛠 Troubleshooting
 
-### "Il TX non si connette all'RX"
-- L'RX ha un IP diverso? Verifica sul router. Aggiorna il port forwarding
-- La porta 7373 è forwardata sul router? Usa [canIP](https://www.canyouseeme.org) per testarla
-- Il TX è su hotspot? Alcuni operatori bloccano la 7373 in uscita
-- Controlla il log seriale del TX: cerca `TCP connect timeout 15s`
+## TX does not connect
 
-### "Il display non si accende"
-- Display non saldato/collegato? Il dispositivo funziona anche senza
-- I2C non rilevato all'avvio: logga `SSD1306 not detected on I2C bus`
-- Pull-up I2C mancanti? Aggiungi resistenze 4.7kΩ su SDA/SCL a 3.3V
-
-### "Il CW si sente ma poi si ferma"
-- Connessione TCP caduta? Controlla il pallino `█` sul display
-
-### "Il volume è zero"
-- Volume regolabile via web UI o MODE + WPM +/- dopo aver premuto MODE
-- Controlla che `VOL: OFF` non sia visualizzato sul display
-
-### "Il WiFi si disconnette continuamente"
-- Segnale debole? Avvicina il dispositivo al router
-- Rete 5GHz? Il ESP32-C6 supporta solo 2.4GHz
-- Troppe reti sullo stesso canale? Prova a cambiare canale sul router
-
-### "Dopo un erase, il dispositivo non si connette più al WiFi"
-- Le credenziali WiFi erano in NVS che è stato cancellato
-- Riconnettiti all'AP `C6_KEYER` e riconfigura
+- Verify port forwarding
+- Verify public IP address
+- Check firewall rules
+- Confirm mobile provider allows outgoing TCP connections
 
 ---
 
-## Specifiche tecniche
+## Display not working
 
-| Parametro | Valore |
-|-----------|--------|
-| MCU | ESP32-C6 (RISC-V, 160 MHz) |
-| WiFi | 2.4 GHz 802.11 b/g/n/ax (WiFi 6) |
-| Display | SSD1306 I2C 128×64 (opzionale) |
-| Buzzer | PWM 600 Hz, volume 0-10 |
-| Range WPM | 5-70 |
-| Latenza buffer | 50-1000 ms (default 200 ms) |
-| Keepalive TCP | 1s idle, 1s interval, 2 probe (rileva caduta in ~3s) |
-| Porte | 80 (web UI), 7373 (CW TCP) |
-| Alimentazione | 5V USB / pin VBUS, BMS step-up 3.7V→5V su batteria Li, ~200 mA |
+- Verify I²C wiring
+- Verify pull-up resistors
+- Check SSD1306 compatibility
 
-## Build da sorgente
+---
+
+## CW stops unexpectedly
+
+- Check TCP connectivity
+- Verify Internet stability
+- Observe connection indicator on OLED
+
+---
+
+## No audio from buzzer
+
+- Volume may be zero
+- Check speaker wiring
+
+---
+
+# 📊 Technical Specifications
+
+| Parameter | Value |
+|----------|---------|
+| MCU | ESP32-C6 (RISC-V) |
+| CPU | 160 MHz |
+| WiFi | 2.4 GHz 802.11 b/g/n/ax |
+| Display | SSD1306 OLED |
+| WPM Range | 5–70 |
+| Latency Buffer | 0–1000 ms |
+| Web Server | Port 80 |
+| CW TCP Port | 7373 |
+| Supply Voltage | 5 V USB or 5V via 15 and 16 pin (i.e. BMS + Li-Ion battery)|
+| Consumption | ~200 mA |
+
+---
+
+# 🔨 Build From Source
 
 ```bash
-git clone https://github.com/.../ESP32RemoteKeyer.git
+git clone https://github.com/Panko74/ESP32-Remote-CW-Keyer.git
+
 cd ESP32RemoteKeyer
+
+pio run
+
 pio run -t upload
 ```
 
-## Future implementazioni
-- Pubblicazione dello schema dei collegamenti
-- DNS dinamico per provider internet senza IP pubblico statico 
+---
 
-## Licenza
+# 🗺 Roadmap
 
-MIT
+- [X] Wiring schematic
+- [ ] OTA firmware updates
+- [ ] Dynamic DNS support
+- [ ] TLS encrypted transport
+- [ ] IPv6 support
+- [ ] Battery-powered portable enclosure
+- [ ] Embedded battery charging system
+
+---
+
+# 🤝 Contributing
+
+Pull requests, bug reports and enhancement suggestions are welcome.
+
+---
+
+# 📜 License
+
+Released under the MIT License.
+
+73 de IW5DUA
