@@ -17,3 +17,6 @@ Note.txt
 
 # Schema PCB (non necessario per il firmware)
 schema/ESP32Keyer/
+
+# Generated files
+dependencies.lock
